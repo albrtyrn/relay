@@ -1,2 +1,2 @@
 # relay
-An orchestration engine for AI-driven database migrations. It persists agent state, coordinates human approval, and safely resumes execution with concurrency control and idempotent APIs.
+A Postgres-backed job system that gates AI-generated schema migrations behind human approval that survives worker crashes and concurrent approvals.
