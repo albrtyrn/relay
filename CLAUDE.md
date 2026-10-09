@@ -12,6 +12,8 @@ I'm learning backend and distributed systems by building it. I must be able to e
 - target_db (Postgres): disposable demo database where approved migrations run
 - LLM: fake adapter until Phase 2, then Groq
 - Docker Compose locally; pytest against real Postgres
+- Environment: API, workers, and tests run in Docker Linux containers from one pinned image (e.g. python:3.13-slim) with exact versions in requirements.txt. Nothing depends on host Python (dev machines: Windows 11 ARM64 and x64).
+- DB layer: psycopg 3, synchronous, plain SQL. No SQLAlchemy or asyncpg. FastAPI endpoints are plain `def`.
 
 relay_db and target_db are separate: no transaction spans both.
 
@@ -36,7 +38,7 @@ States: PENDING -> DRAFTING -> WAITING_FOR_APPROVAL -> APPROVED -> EXECUTING -> 
 ## Invariants (never break these)
 1. Every status change goes through the transition helper.
 2. Never hold a transaction or row lock across an LLM call or other slow work.
-3. Every worker write to Relay that depends on its claim checks the current lease_token and expected status, and commits atomically with its audit event.
+3. Every worker write to Relay that depends on its claim checks the current lease_token and expected status, and commits atomically with its audit event. The lease_token is an ownership token, not a fencing token: it stops a stale worker from changing Relay's state; the relay_applied marker protects the target.
 4. On the target, insert the relay_applied marker before the DDL, in the same transaction. An existing marker counts as success only if its sql_hash matches the approved hash.
 5. Integration tests use real Postgres, never mocks.
 6. The README claims no guarantee that a test doesn't demonstrate.

@@ -253,13 +253,14 @@ By day 30 I should be able to answer each of these out loud in under two minutes
 
 The goal of each session is understanding first and code second. A day where I understand one thing deeply and ship little is a good day; a day where Claude Code ships a lot that I can't explain is a bad one.
 
-### The five invariants
+### The six invariants
 
 1. Every status change goes through the transition helper. Nothing else writes `status`.
 2. Never hold a transaction or row lock across an LLM call or any slow work. Claim, commit, then work.
 3. Every worker write to Relay that depends on its claim is conditional on the current `lease_token` and expected status, and commits atomically with its audit event. (Plain logging doesn't need the token.)
 4. On the target, insert the `relay_applied` marker before the DDL, in the same transaction. An existing marker counts as success only if its `sql_hash` matches.
-5. Never claim a guarantee in the README that a test doesn't prove.
+5. Integration tests use real Postgres, never mocks.
+6. Never claim a guarantee in the README that a test doesn't prove.
 
 ### Working with Claude Code
 

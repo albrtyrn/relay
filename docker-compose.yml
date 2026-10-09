@@ -1,0 +1,15 @@
+services:
+  postgres:
+    # TODO: replace with the exact 18.x tag confirmed by `docker pull` (e.g. postgres:18.N).
+    image: postgres:18.PIN_ME
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set it in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it in .env}
+      POSTGRES_DB: relay_db
+    volumes:
+      # Postgres 18+ images keep data under /var/lib/postgresql/<major>/docker,
+      # so the volume mounts the parent directory, not .../data.
+      - pgdata:/var/lib/postgresql
+
+volumes:
+  pgdata:
