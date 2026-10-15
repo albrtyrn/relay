@@ -175,13 +175,13 @@ About 30 hours at an hour a day: the core (all five mechanisms, built against th
 1. *Predict:* write the invariant in one sentence, e.g. "two workers can never claim the same row."
 2. *Specify:* write or ask for the test first.
 3. *Implement:* have Claude Code make one small change that passes it, and read the whole diff.
-4. *Explain:* one entry in `LEARNING.md`, including one way it could fail.
+4. *Explain:* one entry in my learning notes (in Notion), including one way it could fail.
 
 If I can't explain a diff, I don't keep it.
 
 **Week 1: Durable API** (gate: create a migration, restart every container, and read the same record back)
 
-- [ ] Day 1: Repo setup (`.gitignore`, `.gitattributes`, `CLAUDE.md`, `LEARNING.md`); Docker Compose with Postgres; connect with `psql` and look around
+- [ ] Day 1: Repo setup (`.gitignore`, `.gitattributes`, `CLAUDE.md`); Docker Compose with Postgres; connect with `psql` and look around
 - [ ] Day 2: SQL by hand: tables, constraints, `BEGIN` / `COMMIT` / `ROLLBACK`
 - [ ] Day 3: Dockerfile for the API; FastAPI and Pydantic basics; `GET /health`
 - [ ] Day 4: `migrations` and `migration_events` tables; create and get endpoints
@@ -280,7 +280,7 @@ The goal of each session is understanding first and code second. A day where I u
 
 ### Session habits
 
-- **Start** (5 min): `git pull`; reread yesterday's `LEARNING.md` entry and today's checklist item; write today's invariant in one sentence.
+- **Start** (5 min): `git pull`; reread yesterday's learning-notes entry in Notion and today's checklist item; write today's invariant in one sentence.
 - **End** (5 min): tests pass or I've noted exactly where I stopped; commit with a message I write that says why; `git push`.
 - **Stuck for 20 minutes?** Read the full error from the bottom up, check `docker compose logs`, then ask Claude to explain the cause.
 - **At each weekly gate:** explain that week's concepts out loud without notes, write that part of the README from memory, and `git tag week-N`.
@@ -289,4 +289,4 @@ The goal of each session is understanding first and code second. A day where I u
 
 - Secrets live in `.env` (gitignored); commit `.env.example` with fake values. Never commit the Groq key.
 - Tests reset the database between runs, so results never depend on leftovers.
-- `CLAUDE.md` holds working rules for Claude Code; this file holds what to build; `LEARNING.md` holds my notes.
+- `CLAUDE.md` holds working rules for Claude Code; this file holds what to build; my learning notes live in Notion.

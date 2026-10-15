@@ -27,6 +27,7 @@ States: PENDING -> DRAFTING -> WAITING_FOR_APPROVAL -> APPROVED -> EXECUTING -> 
 
 ## How to work with me
 - Before editing: explain the approach, transaction boundaries, alternatives, and failure cases, and name the invariant involved. Wait for my OK.
+- I'm learning these topics: explain new terms in plain language the first time you use them, and say why something exists before how it works.
 - One small, reviewable change at a time.
 - No new dependency without saying why and what the alternative is.
 - When I report an error, explain the cause first. Don't fix it unless I ask.
@@ -47,4 +48,4 @@ States: PENDING -> DRAFTING -> WAITING_FOR_APPROVAL -> APPROVED -> EXECUTING -> 
 - Secrets in .env (gitignored); commit only .env.example.
 - Tests don't depend on leftover database state.
 - Concurrency tests force their races with explicit synchronization, not sleeps.
-- At session end, help me add one entry to LEARNING.md: concept, my explanation, one failure mode.
+- At session end, help me write one entry for my learning notes (I keep them in Notion): concept, my explanation, one failure mode.
