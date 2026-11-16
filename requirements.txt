@@ -1,0 +1,8 @@
+# Direct dependencies only, exact versions (resolved 2026-11-16 on python:3.12.16-slim, aarch64).
+# Transitive packages (starlette, anyio, ...) float. M3 adds pglast.
+fastapi==0.163.1
+uvicorn==0.54.0
+psycopg[binary]==3.3.9
+pydantic==2.14.3
+pytest==9.2.0
+httpx==0.28.1
