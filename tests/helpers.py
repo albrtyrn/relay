@@ -1,10 +1,14 @@
 """Shared test helpers. Grows with the milestones (DESIGN.md section 2)."""
 
+import os
+import subprocess
+import sys
 import threading
 import time
 import uuid
 
 from relay import db
+from relay.llm import LLMTransientError, Proposal
 from relay.sqlhash import sha256_hex
 
 # What each status requires to exist in the row, mirroring the CHECK constraints in
@@ -125,3 +129,76 @@ def wait_until_blocked(conn, pid: int) -> None:
             return
         time.sleep(0.01)
     raise AssertionError(f"session {pid} never blocked on a lock")
+
+
+def expire_lease(conn, migration_id) -> None:
+    """Make a lease look expired by moving its expiry one second into the past.
+
+    Tests never wait for a real lease to run out (DESIGN.md section 7.4). This touches only
+    `lease_expires_at`, never `status`: the status still changes only through the helper.
+    """
+    conn.execute(
+        "UPDATE migrations SET lease_expires_at = now() - interval '1 second' WHERE id = %s",
+        (migration_id,),
+    )
+
+
+class FixedLLM:
+    """A test LLM that always proposes the same SQL. Lets a test tell two workers' results apart."""
+
+    def __init__(self, sql: str, risk_level: str = "LOW"):
+        self._proposal = Proposal(sql=sql, risk_level=risk_level, risk_reason="fixed test proposal")
+
+    def propose(self, description: str, schema_summary: str) -> Proposal:
+        return self._proposal
+
+
+class CountingLLM:
+    """Wraps another LLM and records every description it was asked about (thread-safe)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._lock = threading.Lock()
+        self.calls: list[str] = []
+
+    def propose(self, description: str, schema_summary: str) -> Proposal:
+        with self._lock:
+            self.calls.append(description)
+        return self._inner.propose(description, schema_summary)
+
+
+class FlakyLLM:
+    """Raises LLMTransientError for the first `failures` calls, then behaves like `inner`."""
+
+    def __init__(self, inner, failures: int = 1):
+        self._inner = inner
+        self._failures_left = failures
+        self.calls = 0
+
+    def propose(self, description: str, schema_summary: str) -> Proposal:
+        self.calls += 1
+        if self._failures_left > 0:
+            self._failures_left -= 1
+            raise LLMTransientError("flaky test LLM: try again later")
+        return self._inner.propose(description, schema_summary)
+
+
+def spawn_worker(settings, worker_id: str, hook: str) -> subprocess.Popen:
+    """Start a real worker process (`python -m relay.worker`) against the test database.
+
+    `hook` is a RELAY_HOOK value such as "claim.after_commit:crash", which makes the process
+    die on the spot at that named point, with no cleanup, like `kill -9` (DESIGN.md section 7.5).
+    """
+    env = {
+        **os.environ,
+        "RELAY_DB_DSN": settings.relay_db_dsn,
+        "WORKER_ID": worker_id,
+        "RELAY_HOOK": hook,
+    }
+    return subprocess.Popen(
+        [sys.executable, "-m", "relay.worker"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )

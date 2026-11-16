@@ -11,10 +11,12 @@ import pytest
 from fastapi.testclient import TestClient
 from psycopg.conninfo import make_conninfo
 
-from relay import db
+from relay import db, hooks
 from relay.api import create_app
 from relay.config import Settings
 from relay.dbinit import init_databases
+from relay.llm.fake import FakeLLM
+from relay.worker import Worker
 
 RELAY_TEST_DB = "relay_test"
 TARGET_TEST_DB = "target_test"
@@ -61,3 +63,29 @@ def broken_client(settings) -> TestClient:
     """An HTTP client whose app cannot reach its database (port 1 refuses connections)."""
     dead = replace(settings, relay_db_dsn=make_conninfo(settings.relay_db_dsn, host="127.0.0.1", port=1))
     return TestClient(create_app(dead))
+
+
+@pytest.fixture(autouse=True)
+def clear_hooks():
+    """Remove every hook a test registered, so one test's pause cannot leak into the next."""
+    yield
+    hooks.clear()
+
+
+@pytest.fixture
+def make_worker(settings):
+    """Build in-process workers wired to relay_test; their connections are closed afterwards.
+
+    `make_worker("w1")` uses the fake LLM. Pass `llm=` for a test double, and keyword
+    overrides such as `max_attempts=2` to change a setting for that worker only.
+    """
+    workers = []
+
+    def make(worker_id: str, llm=None, **overrides) -> Worker:
+        worker = Worker(replace(settings, **overrides), llm or FakeLLM(), worker_id=worker_id)
+        workers.append(worker)
+        return worker
+
+    yield make
+    for worker in workers:
+        worker.close()

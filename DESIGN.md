@@ -349,6 +349,8 @@ FOR UPDATE SKIP LOCKED;
 
 `FOR UPDATE` locks the chosen row until commit. `SKIP LOCKED` makes other workers pass over a locked row instead of waiting for it.
 
+**M3 builds this with `WHERE status = 'PENDING'` only** (D32). The `APPROVED` half of the `WHERE`, and `APPROVED → EXECUTING`, arrive in M4 with the execute path. The same holds for the reclaim sweep in §4.5: M3 reclaims `DRAFTING` only.
+
 Two properties this operation must have, both tested in `test_claim.py`:
 
 - **The lease is set by the helper, in the same `UPDATE` as the status change.** `lease_token`, `lease_expires_at`, and `attempts` travel in `set_fields`, so status, lease, and audit event commit together. There is never a committed `DRAFTING`/`EXECUTING` row without a lease (the `lease_matches_status` CHECK would reject it anyway).
@@ -494,19 +496,18 @@ FOR UPDATE SKIP LOCKED;
 
 ## 5. Worker loop
 
-`Worker(settings, llm, worker_id)` exposes `run_once() -> bool` (did it do anything) and `run_forever()`. Tests call `run_once`; the container runs `run_forever`. One long-lived Relay connection; a target connection is opened per execution.
+`Worker(settings, llm, worker_id)` exposes `run_once() -> str` and `run_forever()`. `run_once` returns what the pass did: `idle`, `saved`, `failed`, `abandoned` (temporary error, lease left to expire), or `lost` (the final write matched 0 rows) (D31). Tests call `run_once`; the container runs `run_forever`. One long-lived Relay connection; a target connection is opened per execution.
 
 ```
 run_once():
   R1  reclaim_expired()                         # Relay txn, §4.5
   R2  claim = claim_one()                       # Relay txn, §4.2; commits before returning
-      hooks.fire("claim.after_commit")
-      if claim is None: return False
+      if claim is None: return "idle"
+      hooks.fire("claim.after_commit")          # only when a claim was made
 
-      if claim.attempts > MAX_ATTEMPTS: exhausted(claim); return True
-      if claim.status == DRAFTING:  draft(claim)
-      if claim.status == EXECUTING: execute(claim)
-      return True
+      if claim.attempts > MAX_ATTEMPTS: return exhausted(claim)
+      if claim.status == DRAFTING:  return draft(claim)
+      if claim.status == EXECUTING: return execute(claim)
 
 draft(claim):                                   # acts on PENDING jobs
       proposal = llm.propose(description, schema_summary)     # no transaction open
@@ -527,7 +528,7 @@ exhausted(claim):                               # retry limit reached
                  otherwise     -> R4' transition(EXECUTING -> FAILED, token, error = 'retry limit reached')
 ```
 
-`run_forever` sleeps `POLL_SECONDS` (plus a little random jitter so workers do not poll in step) when `run_once` returns `False`, and finishes the current job before exiting on `SIGTERM`.
+`run_forever` sleeps `POLL_SECONDS` (plus a little random jitter so workers do not poll in step) when `run_once` returns `idle`, and finishes the current job before exiting on `SIGTERM`.
 
 **There is one retry mechanism: abandon the lease.** A worker that cannot finish does nothing further; the lease expires, reclaim returns the job to the queue, and `attempts` counts up to the limit.
 
@@ -738,8 +739,11 @@ Dockerfile, Compose (postgres healthcheck, `dbinit`, `api`, `tests`), `config.py
 - `test_fake_llm.py::test_directives_raise_transient_and_permanent`
 - `test_claim.py::test_claim_sets_drafting_token_expiry_attempts_and_event`
 - `test_claim.py::test_claim_on_empty_queue_returns_none`
-- `test_claim.py::test_two_claimers_one_row_second_gets_none` (A holds its claim transaction open; B claims and gets nothing, without waiting)
-- `test_claim.py::test_claim_is_committed_before_llm_runs` (inside the fake LLM call: another connection sees `DRAFTING`, and the worker's connection is idle, not in a transaction)
+- `test_claim.py::test_claim_ignores_rows_that_are_not_pending` (D32), `test_claim_takes_the_oldest_pending_row_first`
+- `test_claim.py::test_second_claimer_skips_the_locked_row_and_takes_the_next`
+- `test_claim.py::test_four_claimers_50_rows_each_row_claimed_exactly_once` (counts the claims `claim_one` returned: 50, all distinct)
+- `test_claim.py::test_two_claimers_one_row_second_gets_none` (A's claim runs inside an outer transaction the test keeps open, so its row lock is still held; B claims and gets nothing, without waiting)
+- `test_generation.py::test_claim_is_committed_before_llm_runs` (inside the fake LLM call: another connection sees `DRAFTING`, and the worker's connection is idle, not in a transaction)
 - `test_generation.py::test_happy_path_reaches_waiting_with_sql_hash_and_risk`
 - `test_generation.py::test_policy_violation_marks_failed_with_error`
 - `test_generation.py::test_llm_permanent_error_marks_failed`
@@ -748,9 +752,12 @@ Dockerfile, Compose (postgres healthcheck, `dbinit`, `api`, `tests`), `config.py
 - `test_reclaim.py::test_unexpired_lease_is_not_reclaimed`
 - `test_reclaim.py::test_owner_can_finish_after_expiry_if_not_yet_reclaimed`
 - `test_stale_worker.py::test_stale_drafter_write_matches_zero_rows` (A paused at `draft.before_save`; lease expired; B reclaims, claims, finishes; A released; A's write returns `False`; row and events show only B's result)
+- `test_stale_worker.py::test_stale_drafter_cannot_overwrite_a_new_owner_mid_draft` (B has re-claimed but not finished, so both see `DRAFTING` and only the token stops A)
 - `test_crash_generation.py::test_worker_killed_after_claim_is_reclaimed_and_job_completes` (subprocess, `claim.after_commit:crash`)
 - `test_worker_contention.py::test_generation_50_jobs_4_workers` (all 50 `WAITING_FOR_APPROVAL`; each id has exactly one `PENDING → DRAFTING` event and one LLM call)
 - `test_retry_limit.py::test_generation_fails_after_max_attempts`
+- `test_retry_limit.py::test_successful_draft_resets_attempts_to_zero` (D30)
+- Also: `test_generation.py::test_invalid_risk_level_marks_failed`, `test_idle_when_queue_is_empty`; `test_reclaim.py::test_reclaim_keeps_the_attempt_count`; `test_fake_llm.py::test_fake_does_not_judge_the_table`, `test_get_llm_returns_the_fake_and_rejects_unknown_providers`; `test_policy.py::test_violation_names_the_rule`
 
 ### M4: Marker-first execution
 
@@ -833,6 +840,9 @@ Target schema and role, `target.py` [core], `worker.py` execute path, reclaim fo
 | D27 | **Accepted 2026-11-16 (M2).** Approve/reject read the row with a plain `SELECT` (no lock) to pick `404`/`409`, then rely on the helper's compare-and-set. **Assumption: READ COMMITTED.** The loser's waiting `UPDATE` re-checks its `WHERE` after the winner commits and matches 0 rows (`409`). At REPEATABLE READ it would get a serialization error (a `500`) instead. `db.connect` pins the level on every connection; `test_connections_run_at_read_committed` asserts it and `test_read_committed_is_pinned_not_inherited` shows the pin overrides a different session default. | `SELECT ... FOR UPDATE` in the read; adding a hash condition to the helper's `WHERE` | The lock-free read is safe because a row never returns to `WAITING_FOR_APPROVAL` and nothing edits a waiting proposal, so a matching status implies the hash that was checked. `FOR UPDATE` would make losers queue on the read, so the compare-and-set would never be what decides the race. A hash condition changes the §4.1 signature for one caller. |
 | D28 | **Accepted 2026-11-16 (M2).** The helper raises `RuntimeError` when the connection has no transaction open | Trust the documented precondition | On an autocommit connection, a caller that forgets the `with` block would commit the `UPDATE` and the audit event separately, silently breaking invariant 3. One check turns that into a loud bug. |
 | D29 | **Accepted 2026-11-16 (M2).** Reject is bound to the SQL hash like approve, and `reason` is required (1 to 2000 characters after trimming) | Reject without a hash; optional reason | PLAN says reject follows "the same rules as approve": a decision always refers to the exact SQL the reviewer saw. A required reason keeps the audit log useful. |
+| D30 | **Accepted 2026-11-16 (M3).** The retry limit counts per phase, not per job: a successful draft (R3) resets `attempts` to 0, so drafting and execution each get `MAX_ATTEMPTS` claims | One counter for the whole job, never reset; two separate counter columns | Drafting and execution fail for unrelated reasons (the LLM vs. the target database), so a job that needed four tries to draft should not reach execution with one try left. One column that resets is simpler than two, and the full history is still in `migration_events`. Cost: one job can use up to 2 × `MAX_ATTEMPTS` claims in total. |
+| D31 | **Added at M3.** `run_once()` returns an outcome string (`idle`, `saved`, `failed`, `abandoned`, `lost`) instead of a bool, and `claim.after_commit` fires only when a claim was made | `-> bool` ("did anything") as first written in §5; firing the hook on every pass | Tests need to assert that a stale worker's pass ended as `lost`, not just that it "did something". A crash hook that fired with no claim would kill a worker that was merely idle. |
+| D32 | **Accepted 2026-11-16 (M3).** Until M4 the claim takes only `PENDING` rows and reclaim handles only `DRAFTING` | Build §4.2's full `WHERE status IN ('PENDING', 'APPROVED')` now | The execute path does not exist yet. A worker that claimed an approved job would have nothing to do with it, and the job would cycle between `EXECUTING` and `APPROVED` until the retry limit failed it. |
 
 ---
 

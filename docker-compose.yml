@@ -1,4 +1,4 @@
-# Services: postgres, dbinit (runs once), api, worker (placeholder until M3), tests (on demand).
+# Services: postgres, dbinit (runs once), api, worker (2 processes), tests (on demand).
 # One Postgres server holds relay_db and target_db. They are separate databases,
 # so no transaction can span both (CLAUDE.md, Architecture).
 
@@ -45,11 +45,15 @@ services:
       dbinit:
         condition: service_completed_successfully
 
-  # Placeholder: real worker logic arrives in M3. It only proves the service builds and stays up.
+  # Two worker processes drain the same queue (CLAUDE.md: "Workers (2+ processes)").
+  # Each gets its own WORKER_ID by default: container host name plus process id.
+  # M3: they draft proposals (PENDING -> WAITING_FOR_APPROVAL). Execution arrives in M4.
   worker:
     build: .
-    init: true # lets `docker compose down` stop it at once instead of waiting 10 s
-    command: ["python", "-c", "import time; print('worker placeholder (real worker arrives in M3)', flush=True); time.sleep(10**9)"]
+    init: true # forwards SIGTERM so `docker compose down` stops the worker promptly
+    command: ["python", "-m", "relay.worker"]
+    deploy:
+      replicas: 2
     environment: *relay-env
     depends_on:
       dbinit:
