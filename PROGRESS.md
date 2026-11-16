@@ -7,15 +7,19 @@ Status values: `not started`, `in progress`, `done`.
 ## Current state (updated 2026-11-16)
 
 - **Done:** M1 built and its automated checks pass (28 tests); the manual restart gate passed. Earlier: DESIGN.md written, all 25 §1 resolutions accepted, D8, D9, D13 accepted, Python fixed at 3.12.
-- **Next:** M2 (transition helper, approve, reject). It touches transactions and row locks, so CLAUDE.md requires a plan and Albert's OK first. Waiting for Albert's go.
+- **Done since:** M2 built; all its tests pass (93 in the suite). Waiting for Albert's review and commit.
+- **Next:** M3 (claim, leases, generation). It touches locks and leases, so it needs a plan and Albert's OK first.
+- **Answered (Albert, 2026-11-16):**
+  - Keep D16: one connection per request, no `psycopg_pool`.
+  - No `pytest-repeat`. Repeat race tests with a shell loop (DESIGN §7.1 and §7.7 updated).
+  - M2 plan choices accepted as D27, D28, D29, plus the READ COMMITTED assumption recorded with D27 and tested.
+  - Do not install `httpx2`. The test run prints `StarletteDeprecationWarning: Using httpx with starlette.testclient is deprecated; install httpx2 instead.` This is known and ignored; `httpx` works today. Revisit only if `TestClient` stops working.
 - **Open questions:**
-  1. `psycopg_pool` is in CLAUDE.md's approved stack, but D16 opens one connection per API request and uses no pool. M1 followed D16. Keep it, or use the pool?
-  2. `pytest-repeat` (for `--count=20`, needed from M2) is not in the approved stack. Approve it, or use a shell loop?
-  3. CLAUDE.md says "short leases or an injectable clock"; the accepted §1 #20 has tests backdate `lease_expires_at` instead. Confirm backdating is fine, or CLAUDE.md should be reworded.
-  4. PLAN.md line 60 still says "e.g. `python:3.13-slim`". Not edited; update when PLAN is next touched.
-  5. The test run prints `StarletteDeprecationWarning: Using httpx with starlette.testclient is deprecated; install httpx2 instead.` `httpx` is in the approved stack and works today. Ask before adding `httpx2`? (No-library alternative: ignore the warning until it breaks.)
-  6. This session read DESIGN §8 as the M1 scope (14 listed tests), which is wider than the five tests in the prompt, and left `target_schema.sql` and the role to M4. Say so if you wanted them in M1.
-- **Untested:** see M1 below. Everything from M2 on has no code. The pglast wheel check was read from PyPI, not an image build (pglast is not installed until M3).
+  1. CLAUDE.md says "short leases or an injectable clock"; the accepted §1 #20 has tests backdate `lease_expires_at` instead. Confirm backdating is fine, or CLAUDE.md should be reworded.
+  2. PLAN.md line 60 still says "e.g. `python:3.13-slim`". Not edited; update when PLAN is next touched.
+  3. This session read DESIGN §8 as the M1 scope (14 listed tests), which is wider than the five tests in the prompt, and left `target_schema.sql` and the role to M4. Say so if you wanted them in M1.
+  4. READ COMMITTED is asserted by a test but not pinned in code: `db.connect` relies on the server default. Pin it explicitly (`conn.isolation_level = READ_COMMITTED`) so a changed server setting cannot alter behavior? Not done; it was not in the M2 plan.
+- **Untested:** see M1 and M2 below. Everything from M3 on has no code. The pglast wheel check was read from PyPI, not an image build (pglast is not installed until M3).
 
 ## M1: Scaffolding
 
@@ -46,16 +50,28 @@ Status values: `not started`, `in progress`, `done`.
 
 ## M2: Transition helper, approve, reject
 
-- Status: not started
-- Started: / Finished:
+- Status: in progress (all exit checks pass; waiting on Albert's review)
+- Started: 2026-11-16 / Finished:
 - Scope: `transitions.py` (core operation), `service.py`, approve and reject endpoints bound to the SQL hash
 - Exit checks:
-  - [ ] `test_transitions.py`
-  - [ ] `test_approve_reject.py`
-  - [ ] `test_concurrent_approval.py`
-- Last test run (command, result):
+  - [x] `test_transitions.py` (DESIGN's nine, plus READ COMMITTED, no-open-transaction, right-token, unknown-id, detail, and legal-table tests)
+  - [x] `test_approve_reject.py` (DESIGN's seven, plus reject stale hash, approve after reject, bad body, malformed id, ignored Idempotency-Key)
+  - [x] `test_concurrent_approval.py` (20 approvals; 10 approvals vs 10 rejections)
+- Last test run (PowerShell):
+  - Red run first: `docker compose run --rm tests pytest -q` -> exit 2, `ModuleNotFoundError: No module named 'relay.transitions'` and `cannot import name 'service'`.
+  - `docker compose run --rm tests pytest -q` -> `93 passed, 1 warning`.
+  - Repeat: `docker compose run --rm tests sh -c 'for i in $(seq 20); do pytest tests/test_concurrent_approval.py tests/test_transitions.py -q -p no:cacheprovider 2>&1 | tail -1 || exit 1; done'` -> `30 passed` 20 times out of 20.
+  - Mutation check: with `AND status = <from>` removed from the helper's `WHERE`, 4 tests failed (both concurrency tests, `test_wrong_from_status_returns_false_and_writes_no_event`, `test_second_transaction_waits_then_matches_zero_rows`); the code was then restored and the suite re-run.
 - Not yet tested:
+  - Concurrent approvals over real HTTP (D13; Phase 2 backlog). The 20-way tests call the service from threads.
+  - Behavior at any isolation level other than READ COMMITTED (the test only asserts the level is READ COMMITTED).
+  - A database error or lost connection in the middle of an approve (expected: rollback and a 500; not exercised).
+  - The lease-token paths of the helper are tested only with seeded rows; real worker callers arrive in M3.
+  - A retried approve after a lost response gets 409, by design until M5; pinned by `test_idempotency_key_header_is_accepted_and_ignored`.
 - Notes:
+  - M5 seam: the route handlers open the transaction (`with conn.transaction():`, marked `M5 SEAM` in `relay/api.py`), and `service.approve`/`reject` return `(status_code, body)` without raising, which is the pair M5 will save and replay.
+  - Decisions D27-D29 added to DESIGN.md; §4.1 now documents the approve/reject flow; §7.1 and §7.7 no longer mention `pytest-repeat`.
+  - README updated to M2, claiming only what the tests above show.
 
 ## M3: Claim, leases, generation
 

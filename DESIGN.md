@@ -277,6 +277,28 @@ Rules checked in Python before any SQL (a violation is a bug, so raise `ValueErr
 - `from_status IN ('DRAFTING', 'EXECUTING')` requires `lease_token`. This makes invariant 3 impossible to skip.
 - `set_fields` keys must be in a fixed allow-list of column names: `proposed_sql`, `proposed_sql_hash`, `risk_level`, `risk_reason`, `approved_sql_hash`, `lease_token`, `lease_expires_at`, `attempts`, `error`. Column names are composed with `psycopg.sql.Identifier`, values are always parameters.
 
+One more check, also before any SQL: the connection must have a transaction open, else `RuntimeError` (D28).
+
+#### Approve and reject (`service.py`, M2)
+
+`approve(conn, migration_id, sql_hash, actor)` and `reject(conn, migration_id, sql_hash, reason, actor)` each return `(status_code, body)`. Like the helper, they run inside the caller's transaction. In M2 the route handler opens it (`with conn.transaction():`); in M5 the idempotency reservation does (§4.4).
+
+```sql
+-- 1. plain read, no lock
+SELECT status, proposed_sql_hash FROM migrations WHERE id = %(id)s;
+--    no row                          -> 404
+--    status <> WAITING_FOR_APPROVAL  -> 409
+--    proposed_sql_hash <> sent hash  -> 409 (stale hash)
+
+-- 2. transition(WAITING_FOR_APPROVAL -> APPROVED, set_fields = {approved_sql_hash: <hash>})
+--    or transition(WAITING_FOR_APPROVAL -> REJECTED, detail = <reason>)
+--    False -> 409 (another decision committed between 1 and 2)
+
+-- 3. SELECT <public columns> FROM migrations WHERE id = %(id)s;   -> 200
+```
+
+Step 1 only chooses the error message; step 2's compare-and-set is the protection (D27). Request bodies: approve `{"sql_hash"}`, reject `{"sql_hash", "reason"}` (D29); unknown fields and a malformed hash are `422`.
+
 Legal transitions and what each sets:
 
 | From → To | Caller | Token guard | `set_fields` |
@@ -588,7 +610,7 @@ To verify at M3 before writing the rules: print the parse tree for each allowed 
 
 - `tests` is a Compose service built from the same image, with the repo mounted, `depends_on` postgres being healthy (`pg_isready` healthcheck), in a `test` profile so `docker compose up` does not start it.
 - **Run the suite:** `docker compose run --rm tests pytest`
-- Repeat one race test: `docker compose run --rm tests pytest tests/test_concurrent_approval.py --count=20`
+- Repeat one race test 20 times with a shell loop inside one container (no `pytest-repeat`, declined 2026-11-16): `docker compose run --rm tests sh -c 'for i in $(seq 20); do pytest tests/test_concurrent_approval.py -q || exit 1; done'`
 - Tests use their own databases, `relay_test` and `target_test`, in the same Postgres container, so they never touch dev data.
 
 ### 7.2 Database reset
@@ -648,9 +670,8 @@ Crash tests: `helpers.spawn_worker(hook="execute.after_target_commit:crash")` st
 | `pglast` | real Postgres parser for the policy. 8.8 has `cp312` manylinux wheels for x86_64 and aarch64 (checked on PyPI, 2026-11-16) | regex on SQL, which is exactly what the policy must not be |
 | `pytest` | test runner | (stack) |
 | `httpx` | required by FastAPI's `TestClient` | running a live server for every HTTP test |
-| `pytest-repeat` | `--count=20` to hunt rare interleavings. **Not in CLAUDE.md's approved stack: do not install until Albert approves.** | a shell loop running pytest 20 times |
 
-Not added: an ORM, a migration tool, `pytest-timeout`, `pydantic-settings`. `psycopg_pool` is approved in CLAUDE.md but unused under D16 (open question). Runtime is Python 3.12. Exact versions are pinned when M1 builds the image.
+Not added: an ORM, a migration tool, `pytest-timeout`, `pydantic-settings`, `pytest-repeat` (declined 2026-11-16; a shell loop repeats race tests, §7.1), `httpx2` (declined 2026-11-16; the `TestClient` deprecation warning is ignored while `httpx` works). `psycopg_pool` is approved in CLAUDE.md but unused under D16 (confirmed 2026-11-16). Runtime is Python 3.12. Exact versions are pinned when M1 builds the image.
 
 ---
 
@@ -682,6 +703,8 @@ Dockerfile, Compose (postgres healthcheck, `dbinit`, `api`, `tests`), `config.py
 
 `transitions.py` [core], `service.py`, approve and reject endpoints (`Idempotency-Key` accepted, ignored).
 
+- `test_transitions.py::test_connections_run_at_read_committed` (the assumption under D27)
+- `test_transitions.py::test_called_outside_a_transaction_raises` (D28)
 - `test_transitions.py::test_success_updates_status_and_writes_one_event`
 - `test_transitions.py::test_wrong_from_status_returns_false_and_writes_no_event`
 - `test_transitions.py::test_wrong_lease_token_returns_false`
@@ -693,9 +716,12 @@ Dockerfile, Compose (postgres healthcheck, `dbinit`, `api`, `tests`), `config.py
 - `test_transitions.py::test_second_transaction_waits_then_matches_zero_rows` (A holds its update open; B is seen blocked; A commits; B returns `False`)
 - `test_approve_reject.py::test_approve_200_sets_approved_hash_and_event`
 - `test_approve_reject.py::test_approve_stale_hash_409_and_state_unchanged`
-- `test_approve_reject.py::test_approve_unknown_id_404`
-- `test_approve_reject.py::test_approve_when_not_waiting_409` (parametrized over the other seven states)
+- `test_approve_reject.py::test_unknown_id_404` (approve and reject)
+- `test_approve_reject.py::test_decision_when_not_waiting_409` (approve and reject × the other seven states)
 - `test_approve_reject.py::test_reject_200_records_reason_in_event`
+- `test_approve_reject.py::test_reject_stale_hash_409_and_state_unchanged` (D29)
+- `test_approve_reject.py::test_bad_body_422`, `test_malformed_id_422`
+- `test_approve_reject.py::test_idempotency_key_header_is_accepted_and_ignored` (pins M2 behavior; M5 must change it)
 - `test_approve_reject.py::test_reject_after_approve_409`
 - `test_approve_reject.py::test_missing_x_user_422`
 - `test_concurrent_approval.py::test_20_concurrent_approvals_exactly_one_wins` (1 success, 19 conflicts, exactly one `→ APPROVED` event)
@@ -803,6 +829,9 @@ Target schema and role, `target.py` [core], `worker.py` execute path, reclaim fo
 | D24 | **Added at M1.** `.env.example` and `Settings` list only the variables a milestone actually reads (M1: `POSTGRES_USER`, `POSTGRES_PASSWORD`; Compose assembles `RELAY_DB_DSN` and `ADMIN_DSN` from them). `dbinit` applies `relay_schema.sql` only when `migrations` does not exist yet, and creates an empty `target_db`; the target schema and `relay_migrator` role wait for M4 | List every §7.6 variable in `.env.example` from M1; run the schema on every `dbinit`; build the target schema and role in M1 | Unread variables are noise for someone learning the code, and the target role has nothing to guard until M4 (DESIGN §8 puts it there). Skip-if-present is what makes `docker compose up` safe to repeat while the volume lives on. Cost: a schema change needs `--reset` (already D17). |
 | D25 | **Added at M1.** The API never returns `lease_token` or `lease_expires_at`. `repo.PUBLIC_COLUMNS` is an explicit column list, not `SELECT *` | Return every column | The lease token is a worker's proof of ownership (invariant 3). Anyone who can read it from `GET /migrations/{id}` could write as that worker. Tested in `test_get_hides_lease_fields`. |
 | D26 | **Added at M1.** `POST /migrations` rejects unknown body fields (`extra="forbid"`) and strips whitespace from `description` before the 1..2000 length check; `X-User` is capped at 195 characters | Ignore extra fields; store the description untouched; no cap on `X-User` | v1 takes a description only, so a client sending `proposed_sql` should hear "no" rather than be silently ignored. A whitespace-only description is empty in practice. 195 + the `user:` prefix equals the 200-character limit on `migration_events.actor`. |
+| D27 | **Accepted 2026-11-16 (M2).** Approve/reject read the row with a plain `SELECT` (no lock) to pick `404`/`409`, then rely on the helper's compare-and-set. **Assumption: READ COMMITTED.** The loser's waiting `UPDATE` re-checks its `WHERE` after the winner commits and matches 0 rows (`409`). At REPEATABLE READ it would get a serialization error (a `500`) instead. `test_connections_run_at_read_committed` asserts the level. | `SELECT ... FOR UPDATE` in the read; adding a hash condition to the helper's `WHERE` | The lock-free read is safe because a row never returns to `WAITING_FOR_APPROVAL` and nothing edits a waiting proposal, so a matching status implies the hash that was checked. `FOR UPDATE` would make losers queue on the read, so the compare-and-set would never be what decides the race. A hash condition changes the §4.1 signature for one caller. |
+| D28 | **Accepted 2026-11-16 (M2).** The helper raises `RuntimeError` when the connection has no transaction open | Trust the documented precondition | On an autocommit connection, a caller that forgets the `with` block would commit the `UPDATE` and the audit event separately, silently breaking invariant 3. One check turns that into a loud bug. |
+| D29 | **Accepted 2026-11-16 (M2).** Reject is bound to the SQL hash like approve, and `reason` is required (1 to 2000 characters after trimming) | Reject without a hash; optional reason | PLAN says reject follows "the same rules as approve": a decision always refers to the exact SQL the reviewer saw. A required reason keeps the audit log useful. |
 
 ---
 

@@ -13,10 +13,19 @@ CONNECT_TIMEOUT_SECONDS = 5
 
 
 def connect(dsn: str) -> psycopg.Connection:
-    """Open one autocommit connection whose rows come back as dicts."""
-    return psycopg.connect(
+    """Open one autocommit connection whose rows come back as dicts.
+
+    The isolation level is pinned to READ COMMITTED rather than left to the server's default.
+    With this set, every `with conn.transaction():` block starts with
+    `BEGIN ISOLATION LEVEL READ COMMITTED`. The transition helper depends on that level: the
+    loser of a race gets "0 rows" only because a waiting UPDATE re-checks its WHERE clause
+    after the winner commits (decision D27).
+    """
+    conn = psycopg.connect(
         dsn,
         autocommit=True,
         row_factory=dict_row,
         connect_timeout=CONNECT_TIMEOUT_SECONDS,
     )
+    conn.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
+    return conn

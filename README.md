@@ -2,7 +2,15 @@
 
 Relay is a learning project: a backend service where an AI proposes a Postgres schema change, a human approves it over a REST API, and a pool of workers executes it.
 
-**Status: work in progress (milestone M1 of 5).** Only the scaffolding exists: the API can create, read, and list migration records, and they survive a restart. There is no approval, no worker, and no execution yet. This README makes no reliability claims; each one will be added only once a test demonstrates it.
+**Status: work in progress (milestone M2 of 5).** The API can create, read, list, approve, and reject migration records. There is no worker and no execution yet, so nothing reaches the approval stage on its own and no SQL is ever run. Each claim below is added only once a test demonstrates it.
+
+## What is tested so far
+
+- **Concurrent approvals:** when 20 approvals of the same migration are made at the same moment, exactly one succeeds, the other 19 are refused as conflicts, and exactly one approval event is recorded (`tests/test_concurrent_approval.py`). This test drives the decision code from 20 database connections; it does not send 20 HTTP requests.
+- **Approve or reject, never both:** concurrent approvals and rejections of one migration produce exactly one decision.
+- **Decisions are bound to the SQL:** approve and reject must carry the hash of the proposal the reviewer saw; a different hash is refused with `409` (`tests/test_approve_reject.py`).
+
+Not yet true: a retried approve is not recognized as a retry (it gets `409`); idempotency keys arrive in M5.
 
 ## Running it locally
 
