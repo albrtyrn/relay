@@ -13,13 +13,12 @@ Status values: `not started`, `in progress`, `done`.
   - Keep D16: one connection per request, no `psycopg_pool`.
   - No `pytest-repeat`. Repeat race tests with a shell loop (DESIGN §7.1 and §7.7 updated).
   - M2 plan choices accepted as D27, D28, D29, plus the READ COMMITTED assumption recorded with D27 and tested.
+  - Pin READ COMMITTED explicitly in `db.connect` (done; the level no longer depends on the server default).
   - Do not install `httpx2`. The test run prints `StarletteDeprecationWarning: Using httpx with starlette.testclient is deprecated; install httpx2 instead.` This is known and ignored; `httpx` works today. Revisit only if `TestClient` stops working.
 - **Open questions:**
   1. CLAUDE.md says "short leases or an injectable clock"; the accepted §1 #20 has tests backdate `lease_expires_at` instead. Confirm backdating is fine, or CLAUDE.md should be reworded.
   2. PLAN.md line 60 still says "e.g. `python:3.13-slim`". Not edited; update when PLAN is next touched.
-  3. This session read DESIGN §8 as the M1 scope (14 listed tests), which is wider than the five tests in the prompt, and left `target_schema.sql` and the role to M4. Say so if you wanted them in M1.
-  4. READ COMMITTED is asserted by a test but not pinned in code: `db.connect` relies on the server default. Pin it explicitly (`conn.isolation_level = READ_COMMITTED`) so a changed server setting cannot alter behavior? Not done; it was not in the M2 plan.
-- **Untested:** see M1 and M2 below. Everything from M3 on has no code. The pglast wheel check was read from PyPI, not an image build (pglast is not installed until M3).
+  3. This session read DESIGN §8 as the M1 scope (14 listed tests), which is wider than the five tests in the prompt, and left `target_schema.sql` and the role to M4. Say so if you wanted them in M1.- **Untested:** see M1 and M2 below. Everything from M3 on has no code. The pglast wheel check was read from PyPI, not an image build (pglast is not installed until M3).
 
 ## M1: Scaffolding
 
@@ -59,8 +58,9 @@ Status values: `not started`, `in progress`, `done`.
   - [x] `test_concurrent_approval.py` (20 approvals; 10 approvals vs 10 rejections)
 - Last test run (PowerShell):
   - Red run first: `docker compose run --rm tests pytest -q` -> exit 2, `ModuleNotFoundError: No module named 'relay.transitions'` and `cannot import name 'service'`.
-  - `docker compose run --rm tests pytest -q` -> `93 passed, 1 warning`.
-  - Repeat: `docker compose run --rm tests sh -c 'for i in $(seq 20); do pytest tests/test_concurrent_approval.py tests/test_transitions.py -q -p no:cacheprovider 2>&1 | tail -1 || exit 1; done'` -> `30 passed` 20 times out of 20.
+  - `docker compose run --rm tests pytest -q` -> `94 passed, 1 warning` (after the READ COMMITTED pin; 93 before it).
+  - Repeat: `docker compose run --rm tests sh -c 'for i in $(seq 20); do pytest tests/test_concurrent_approval.py tests/test_transitions.py -q -p no:cacheprovider > /tmp/out.txt 2>&1 || { cat /tmp/out.txt; echo FAILED on run $i; exit 1; }; tail -1 /tmp/out.txt; done; echo all 20 runs passed'` -> `31 passed` 20 times out of 20, exit code 0. (Avoid double quotes inside the `sh -c '...'` string: PowerShell 5.1 mangles them.)
+  - Pin check: with the `conn.isolation_level` line removed from `db.connect`, `test_read_committed_is_pinned_not_inherited` failed; the line was then restored.
   - Mutation check: with `AND status = <from>` removed from the helper's `WHERE`, 4 tests failed (both concurrency tests, `test_wrong_from_status_returns_false_and_writes_no_event`, `test_second_transaction_waits_then_matches_zero_rows`); the code was then restored and the suite re-run.
 - Not yet tested:
   - Concurrent approvals over real HTTP (D13; Phase 2 backlog). The 20-way tests call the service from threads.
