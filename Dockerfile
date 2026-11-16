@@ -16,6 +16,7 @@ COPY pytest.ini .
 COPY db/ db/
 COPY relay/ relay/
 COPY tests/ tests/
+COPY scripts/ scripts/
 
 # Default: the API. `--factory` tells uvicorn to call create_app() to get the app.
 CMD ["uvicorn", "relay.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

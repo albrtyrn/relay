@@ -15,10 +15,12 @@ import os
 import threading
 from collections.abc import Callable
 
-# Every point the code fires. M4 adds the execute hooks, M5 the idempotency hook.
+# Every point the code fires. M5 adds the idempotency hook.
 HOOK_NAMES = frozenset({
-    "claim.after_commit",   # the claim has committed; no work has started
-    "draft.before_save",    # the LLM returned and the policy passed; nothing is saved yet
+    "claim.after_commit",           # the claim has committed; no work has started
+    "draft.before_save",            # the LLM returned and the policy passed; nothing is saved yet
+    "execute.after_marker_insert",  # INSIDE the target transaction: marker statement done, DDL not yet run
+    "execute.after_target_commit",  # the target transaction committed; Relay still says EXECUTING
 })
 
 CRASH_EXIT_CODE = 137  # the code a process killed with `kill -9` reports (128 + signal 9)

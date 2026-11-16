@@ -14,7 +14,7 @@ from psycopg.conninfo import make_conninfo
 from relay import db, hooks
 from relay.api import create_app
 from relay.config import Settings
-from relay.dbinit import init_databases
+from relay.dbinit import MIGRATOR_ROLE, apply_target_schema, init_databases
 from relay.llm.fake import FakeLLM
 from relay.worker import Worker
 
@@ -23,32 +23,62 @@ TARGET_TEST_DB = "target_test"
 
 
 @pytest.fixture(scope="session")
-def settings() -> Settings:
+def admin_dsn() -> str:
+    """The admin (superuser) connection string. Only setup and result checks use it."""
+    return os.environ["ADMIN_DSN"]
+
+
+@pytest.fixture(scope="session")
+def settings(admin_dsn) -> Settings:
     """Create fresh test databases once per session and return Settings that point at them.
 
     Uses the same function as `python -m relay.dbinit --reset`, so the tests build the schema
-    exactly the way the real stack does.
+    and the relay_migrator role exactly the way the real stack does. The worker's target
+    connection string logs in as relay_migrator, never as the admin.
     """
-    admin_dsn = os.environ["ADMIN_DSN"]
-    init_databases(admin_dsn, RELAY_TEST_DB, TARGET_TEST_DB, reset=True)
-    return Settings(relay_db_dsn=make_conninfo(admin_dsn, dbname=RELAY_TEST_DB))
+    migrator_password = os.environ["TARGET_MIGRATOR_PASSWORD"]
+    init_databases(admin_dsn, RELAY_TEST_DB, TARGET_TEST_DB, migrator_password, reset=True)
+    return Settings(
+        relay_db_dsn=make_conninfo(admin_dsn, dbname=RELAY_TEST_DB),
+        target_db_dsn=make_conninfo(
+            admin_dsn, dbname=TARGET_TEST_DB, user=MIGRATOR_ROLE, password=migrator_password
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
-def reset_state(settings):
-    """Empty the relay tables before every test, so no test depends on another.
+def reset_state(settings, admin_dsn):
+    """Empty the relay tables and rebuild the target tables before every test, so no test
+    depends on another.
 
     Reset happens before the test, not after, so a failed test's rows are still there to
-    inspect (DESIGN.md section 7.2). The target database has no tables until M4.
+    inspect (DESIGN.md section 7.2). Truncating is not enough on the target, because tests
+    change table definitions: db/target_schema.sql drops and recreates everything.
     """
     with db.connect(settings.relay_db_dsn) as conn:
         conn.execute("TRUNCATE migrations, migration_events RESTART IDENTITY")
+    apply_target_schema(admin_dsn, TARGET_TEST_DB, force=True)
 
 
 @pytest.fixture
 def conn(settings):
     """A direct autocommit connection to relay_test, for seeding rows and checking results."""
     with db.connect(settings.relay_db_dsn) as connection:
+        yield connection
+
+
+@pytest.fixture
+def target(admin_dsn):
+    """An ADMIN connection to target_test, for test setup and for checking what the worker
+    did there. The code under test never uses it: workers connect as relay_migrator."""
+    with db.connect(make_conninfo(admin_dsn, dbname=TARGET_TEST_DB)) as connection:
+        yield connection
+
+
+@pytest.fixture
+def migrator(settings):
+    """A connection to target_test as relay_migrator: the login the worker itself uses."""
+    with db.connect(settings.target_db_dsn) as connection:
         yield connection
 
 

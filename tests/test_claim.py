@@ -1,15 +1,15 @@
-"""The claim query, core operation 2 of 4 (DESIGN.md section 4.2, M3).
+"""The claim query, core operation 2 of 4 (DESIGN.md section 4.2; M3, widened in M4).
 
-A claim is how a worker takes ownership of one queued job. It picks and locks a PENDING row
-(`SELECT ... FOR UPDATE SKIP LOCKED`), moves it to DRAFTING through the transition helper
-with a fresh lease, and commits, all before any slow work starts.
+A claim is how a worker takes ownership of one queued job. It picks and locks a PENDING or
+APPROVED row (`SELECT ... FOR UPDATE SKIP LOCKED`), moves it to DRAFTING or EXECUTING
+through the transition helper with a fresh lease, and commits, all before any slow work starts.
 """
 
 import psycopg
 
 from relay import db
 from relay.claim import claim_one
-from tests.helpers import run_behind_barrier, seed_migration
+from tests.helpers import SEED_HASH, SEED_SQL, run_behind_barrier, seed_migration
 
 
 def test_claim_sets_drafting_token_expiry_attempts_and_event(conn):
@@ -52,18 +52,58 @@ def test_claim_on_empty_queue_returns_none(conn):
     assert conn.execute("SELECT count(*) AS n FROM migration_events").fetchone()["n"] == 0
 
 
-def test_claim_ignores_rows_that_are_not_pending(conn):
-    """Guarantee (M3): only PENDING rows are claimable. Rows in the other seven states,
-    including APPROVED, are left alone.
+def test_claim_ignores_rows_that_are_not_queued(conn):
+    """Guarantee: only the two queue states, PENDING and APPROVED, are claimable. Rows in the
+    other six states are left alone: leased rows have an owner, WAITING_FOR_APPROVAL belongs
+    to the human, and the terminal states are finished.
 
-    Invariant: 1 (a claim is a legal transition or nothing). APPROVED becomes claimable in
-    M4, when the execute path exists; until then a worker that took an approved job would
-    have nothing to do with it.
+    Invariant: 1 (a claim is a legal transition or nothing) and 3 (a leased row is never
+    claimed out from under its owner; only reclaim, after expiry, releases it).
     """
-    for status in ["DRAFTING", "WAITING_FOR_APPROVAL", "APPROVED", "EXECUTING", "SUCCEEDED", "REJECTED", "FAILED"]:
+    for status in ["DRAFTING", "WAITING_FOR_APPROVAL", "EXECUTING", "SUCCEEDED", "REJECTED", "FAILED"]:
         seed_migration(conn, status=status)
 
     assert claim_one(conn, "w1", lease_seconds=60) is None
+
+
+def test_claim_of_approved_row_sets_executing_and_carries_the_approved_sql(conn):
+    """Guarantee (M4): claiming an APPROVED row moves it to EXECUTING with a fresh lease, a
+    counted attempt, and one audit event, and the Claim carries the stored SQL and the
+    approved hash, which is everything the execute path needs.
+
+    Invariant: 3 (the token is the proof of ownership for the SUCCEEDED/FAILED write). The
+    SQL travels in the Claim, read under the claim's row lock, so the worker needs no second
+    read and holds no lock while it runs the target transaction (invariant 2).
+    """
+    migration_id = seed_migration(conn, status="APPROVED")
+
+    claim = claim_one(conn, "w1", lease_seconds=60)
+
+    assert (claim.id, claim.status, claim.attempts) == (migration_id, "EXECUTING", 1)
+    assert (claim.proposed_sql, claim.approved_sql_hash) == (SEED_SQL, SEED_HASH)
+    row = conn.execute("SELECT status, lease_token, attempts FROM migrations WHERE id = %s", (migration_id,)).fetchone()
+    assert row == {"status": "EXECUTING", "lease_token": claim.lease_token, "attempts": 1}
+    events = conn.execute(
+        "SELECT from_status, to_status, actor FROM migration_events WHERE migration_id = %s", (migration_id,)
+    ).fetchall()
+    assert events == [{"from_status": "APPROVED", "to_status": "EXECUTING", "actor": "worker:w1"}]
+
+
+def test_one_queue_serves_both_phases_oldest_first(conn):
+    """Guarantee: PENDING and APPROVED rows share one queue ordered by creation time, so an
+    older approved job is taken before a newer pending one.
+
+    Invariant: none of the six. One query over both states means no phase can starve the
+    other (DESIGN.md section 4.2).
+    """
+    approved = seed_migration(conn, status="APPROVED")
+    pending = seed_migration(conn, status="PENDING")
+
+    first, second = claim_one(conn, "w1", 60), claim_one(conn, "w1", 60)
+
+    assert [(first.id, first.status), (second.id, second.status)] == [
+        (approved, "EXECUTING"), (pending, "DRAFTING"),
+    ]
 
 
 def test_claim_takes_the_oldest_pending_row_first(conn):

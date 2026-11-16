@@ -1,14 +1,15 @@
 """The worker: claim a job, do the slow work with no transaction open, save the result
 (DESIGN.md section 5). Run one with `python -m relay.worker`.
 
-M3 implements the draft path: PENDING -> DRAFTING -> (LLM, policy) -> WAITING_FOR_APPROVAL.
-The execute path arrives in M4.
+Two paths, chosen by what was claimed:
+- draft (M3):    PENDING  -> DRAFTING  -> (LLM, policy)        -> WAITING_FOR_APPROVAL
+- execute (M4):  APPROVED -> EXECUTING -> (target transaction) -> SUCCEEDED or FAILED
 
 The shape of every job is the same, and it is what keeps invariant 2:
 
-    short transaction: claim, COMMIT
-    slow work, with NO transaction open
-    short transaction: save, guarded by my lease token, COMMIT
+    short Relay transaction: claim, COMMIT
+    slow work, with NO Relay transaction open
+    short Relay transaction: save, guarded by my lease token, COMMIT
 
 There is one retry mechanism: abandon the lease (decision D7). A worker that cannot finish
 writes nothing more; the lease expires, the reclaim sweep returns the job to the queue, and
@@ -24,9 +25,10 @@ import psycopg
 
 from relay import db, hooks, policy
 from relay.claim import Claim, claim_one, reclaim_expired
-from relay.config import SCHEMA_SUMMARY, Settings, load_settings
+from relay.config import SCHEMA_SUMMARY, Settings, check_lease_outlasts_target_work, load_settings
 from relay.llm import RISK_LEVELS, LLMClient, LLMPermanentError, LLMTransientError, get_llm
 from relay.sqlhash import sha256_hex
+from relay.target import HASH_MISMATCH, DDLFailed, apply_on_target, read_marker_hash
 from relay.transitions import transition
 
 log = logging.getLogger("relay.worker")
@@ -34,15 +36,19 @@ log = logging.getLogger("relay.worker")
 # What one pass of the loop did. `run_once` returns one of these.
 IDLE = "idle"            # nothing to claim
 SAVED = "saved"          # a proposal was saved; the job is WAITING_FOR_APPROVAL
+SUCCEEDED = "succeeded"  # the migration is applied on the target; the job is SUCCEEDED
 FAILED = "failed"        # the job was marked FAILED
-ABANDONED = "abandoned"  # temporary problem; nothing written, the lease will expire
-LOST = "lost"            # my final write matched 0 rows: the job is someone else's now
+ABANDONED = "abandoned"  # temporary problem or unknown outcome; nothing written, the lease will expire
+LOST = "lost"            # the job is no longer mine (0 rows on a write, or my lease ran out)
 
 CLEAR_LEASE = {"lease_token": None, "lease_expires_at": None}
 
 
 class Worker:
     def __init__(self, settings: Settings, llm: LLMClient, worker_id: str | None = None):
+        # Refuse to start if a lease could run out while the target transaction is still
+        # allowed to run (decision D33). Checked before any connection is opened.
+        check_lease_outlasts_target_work(settings)
         self.settings = settings
         self.llm = llm
         self.worker_id = worker_id or settings.worker_id
@@ -67,9 +73,13 @@ class Worker:
 
         if claim.attempts > self.settings.max_attempts:
             # This job has used up its tries in this phase (decision D8). The check is made
-            # by the worker that just claimed it, so the FAILED write has a valid token.
-            return self._fail(claim, "retry limit reached")
-        return self._draft(claim)
+            # by the worker that just claimed it, so its final write has a valid token.
+            return self._exhausted(claim)
+        if claim.status == "DRAFTING":
+            return self._draft(claim)
+        return self._execute(claim)
+
+    # ---------- draft path (PENDING jobs) ----------
 
     def _draft(self, claim: Claim) -> str:
         # The slow part. No transaction is open here (invariant 2).
@@ -106,6 +116,124 @@ class Worker:
             )
         return SAVED if saved else self._lost(claim)
 
+    # ---------- execute path (APPROVED jobs) ----------
+
+    def _execute(self, claim: Claim) -> str:
+        """Run one approved migration on the target, then tell Relay what happened.
+
+        The steps, and where each transaction begins and ends:
+
+            checks   (no transaction)   stored SQL still has the approved hash; policy again
+            connect  (no transaction)   open the target connection as relay_migrator
+            re-check (one Relay read)   the job is still mine and my lease has not run out
+            T1       (target txn)       marker first, then the DDL, COMMIT  -> relay/target.py
+            R4       (Relay txn)        EXECUTING -> SUCCEEDED or FAILED, guarded by my token
+
+        T1 and R4 are separate transactions on separate databases; nothing can make them
+        commit together. If this worker dies between them, the target is already changed and
+        Relay still says EXECUTING. That is safe because of the marker: the next worker's T1
+        finds it and reports ALREADY_APPLIED instead of running the DDL again.
+        """
+        # An approval is for one exact statement. If the stored SQL no longer hashes to what
+        # the reviewer approved, it is unapproved SQL: never run it.
+        if sha256_hex(claim.proposed_sql) != claim.approved_sql_hash:
+            return self._fail(claim, "stored SQL does not match the approved hash")
+        # The policy runs a second time, just before execution (DESIGN.md section 6.2).
+        try:
+            policy.validate(claim.proposed_sql)
+        except policy.PolicyViolation as error:
+            return self._fail(claim, f"policy: {error.rule}")
+
+        try:
+            target_conn = db.connect(self.settings.target_db_dsn)
+        except psycopg.Error as error:
+            log.warning("job %s: cannot reach the target, abandoning the lease: %s", claim.id, error)
+            return ABANDONED
+        try:
+            # Last look before touching the target. If my lease has run out, another worker
+            # may take this job at any moment, so starting now would make me the stale
+            # worker (DESIGN.md section 1 #5). Stop without writing anything.
+            if not self._lease_is_live(claim):
+                return self._lost(claim)
+            try:
+                result = apply_on_target(                                             # T1: target txn
+                    target_conn, claim.id, claim.proposed_sql, claim.approved_sql_hash, self.settings
+                )
+            except DDLFailed as error:
+                # The target refused the statement and rolled everything back, marker included.
+                return self._fail(claim, f"ddl: {error}")
+            except psycopg.Error as error:
+                # Outcome unknown (lost connection, marker contention, error during COMMIT).
+                # Never mark FAILED on an unknown outcome (DESIGN.md section 1 #8): the next
+                # attempt's marker insert will show whether the target committed.
+                log.warning("job %s: target outcome unknown, abandoning the lease: %s", claim.id, error)
+                return ABANDONED
+        finally:
+            target_conn.close()
+
+        # The target transaction has committed. Relay does not know yet.
+        hooks.fire("execute.after_target_commit")
+
+        if result == HASH_MISMATCH:
+            return self._fail(claim, "target marker exists with a different hash")
+        # APPLIED (I ran the DDL) or ALREADY_APPLIED (an earlier attempt did): both are success.
+        return self._succeed(claim)
+
+    def _lease_is_live(self, claim: Claim) -> bool:
+        """One plain read, no lock: is this EXECUTING job still mine, with time left on the lease?
+
+        This is stricter than the token check on a write. A write is accepted after expiry
+        as long as nobody has reclaimed the row (decision D6), because finishing is harmless.
+        STARTING target work on an expired lease is not: it invites a second worker in.
+        """
+        row = self.conn.execute(
+            """
+            SELECT 1 AS mine FROM migrations
+            WHERE id = %s AND status = 'EXECUTING' AND lease_token = %s AND lease_expires_at > now()
+            """,
+            (claim.id, claim.lease_token),
+        ).fetchone()
+        return row is not None
+
+    def _succeed(self, claim: Claim) -> str:
+        """R4: mark my job SUCCEEDED, only if it is still mine."""
+        with self.conn.transaction():
+            succeeded = transition(
+                self.conn, claim.id, "EXECUTING", "SUCCEEDED", f"worker:{self.worker_id}",
+                lease_token=claim.lease_token,
+                set_fields=CLEAR_LEASE,
+            )
+        if not succeeded:
+            # Whoever holds the job now will find the marker and record the success.
+            return self._lost(claim)
+        log.info("job %s: SUCCEEDED", claim.id)
+        return SUCCEEDED
+
+    # ---------- shared endings ----------
+
+    def _exhausted(self, claim: Claim) -> str:
+        """The job is over its retry limit for this phase (decision D8).
+
+        A draft has no side effects, so it simply fails. An execution may have committed on
+        the target in an earlier attempt that died before telling Relay, so look at the
+        marker first: a marker with the approved hash means the migration IS applied.
+        """
+        if claim.status == "DRAFTING":
+            return self._fail(claim, "retry limit reached")
+
+        try:
+            target_conn = db.connect(self.settings.target_db_dsn)
+            try:
+                marker_hash = read_marker_hash(target_conn, claim.id)
+            finally:
+                target_conn.close()
+        except psycopg.Error as error:
+            log.warning("job %s: cannot read the marker, abandoning the lease: %s", claim.id, error)
+            return ABANDONED
+        if marker_hash is not None and marker_hash == claim.approved_sql_hash:
+            return self._succeed(claim)
+        return self._fail(claim, "retry limit reached")
+
     def _fail(self, claim: Claim, error: str) -> str:
         """Mark my job FAILED, only if it is still mine."""
         with self.conn.transaction():
@@ -121,8 +249,8 @@ class Worker:
         return FAILED
 
     def _lost(self, claim: Claim) -> str:
-        # 0 rows: my lease was reclaimed and the job belongs to someone else now.
-        # Stop here; never retry the write.
+        # The job belongs, or may at any moment belong, to someone else: a write matched
+        # 0 rows, or the lease ran out before target work began. Stop here; never retry.
         log.warning("job %s: lost the lease, stopping work on it", claim.id)
         return LOST
 
@@ -167,6 +295,8 @@ class Worker:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = load_settings()
+    # Worker() raises ValueError here if LEASE_SECONDS is too short for the target timeouts
+    # (decision D33); the process exits before claiming anything.
     worker = Worker(settings, get_llm(settings))
     # `docker compose stop` sends SIGTERM: finish the current job, then leave the loop.
     signal.signal(signal.SIGTERM, lambda _signum, _frame: worker.stop())

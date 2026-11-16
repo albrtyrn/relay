@@ -1,6 +1,7 @@
 -- relay_db schema (DESIGN.md section 3.1).
--- M1 holds `migrations` and `migration_events`. `idempotency_keys` arrives in M5 and the
--- REVOKE CONNECT line with the target role in M4.
+-- M1 holds `migrations` and `migration_events`. `idempotency_keys` arrives in M5.
+-- The REVOKE CONNECT that keeps the target role out of this database is run by
+-- relay/dbinit.py, because it has to name the database (relay_db, or relay_test in tests).
 -- Data is disposable, so a schema change means `python -m relay.dbinit --reset` (decision D17).
 
 CREATE TABLE migrations (

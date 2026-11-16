@@ -1,13 +1,22 @@
 """A stale worker: one whose job was taken over while it was still working (DESIGN.md section 8).
 
-M3 covers the drafting case; the executing case arrives in M4.
+Two drafting cases (M3) and the executing case (M4).
 """
 
 import threading
 
 from relay import hooks, worker
 from relay.claim import claim_one, reclaim_expired
-from tests.helpers import THREAD_TIMEOUT, Background, FixedLLM, expire_lease, seed_migration
+from relay.sqlhash import sha256_hex
+from tests.helpers import (
+    THREAD_TIMEOUT,
+    Background,
+    FixedLLM,
+    events_of,
+    expire_lease,
+    markers_of,
+    seed_migration,
+)
 
 SQL_FROM_A = "ALTER TABLE public.customers ADD COLUMN from_a text"
 SQL_FROM_B = "ALTER TABLE public.customers ADD COLUMN from_b text"
@@ -66,6 +75,58 @@ def test_stale_drafter_write_matches_zero_rows(conn, make_worker):
         ("DRAFTING", "PENDING", "reclaimer:b"),
         ("PENDING", "DRAFTING", "worker:b"),
         ("DRAFTING", "WAITING_FOR_APPROVAL", "worker:b"),
+        # and nothing from worker:a after its claim
+    ]
+
+
+def test_stale_executor_write_matches_zero_rows(conn, target, make_worker):
+    """Guarantee: worker A commits on the target and is then overtaken: its lease expires and
+    worker B reclaims, re-claims, finds A's marker, and marks the job SUCCEEDED. When A
+    finally tries to write SUCCEEDED itself, the write matches 0 rows. The DDL ran once and
+    the audit log holds exactly one success, B's.
+
+    Invariant: 3 (A's write is refused: the status is no longer EXECUTING and the token is
+    no longer A's) and 4 (B treats the matching marker as success and skips the DDL).
+    How the race is forced: A is paused by a hook at `execute.after_target_commit`, between
+    its target commit and its Relay write. No sleeps.
+    """
+    sql = "ALTER TABLE public.customers ADD COLUMN nickname text"
+    migration_id = seed_migration(conn, status="APPROVED", sql=sql)
+    worker_a = make_worker("a")
+    worker_b = make_worker("b")
+
+    a_is_paused = threading.Event()
+    a_may_continue = threading.Event()
+    already_paused_someone = []
+
+    def pause_first_caller_only():
+        if already_paused_someone:      # B passes the same line later; let it through
+            return
+        already_paused_someone.append(True)
+        a_is_paused.set()
+        assert a_may_continue.wait(THREAD_TIMEOUT), "test never released worker A"
+
+    hooks.register("execute.after_target_commit", pause_first_caller_only)
+
+    thread_a = Background(worker_a.run_once)
+    try:
+        assert a_is_paused.wait(THREAD_TIMEOUT), "worker A never reached execute.after_target_commit"
+        expire_lease(conn, migration_id)
+        outcome_b = worker_b.run_once()   # reclaims, claims, finds the marker, marks SUCCEEDED
+    finally:
+        a_may_continue.set()
+    outcome_a = thread_a.join()
+
+    assert outcome_b == worker.SUCCEEDED
+    assert outcome_a == worker.LOST
+    assert markers_of(target) == {migration_id: sha256_hex(sql)}
+    row = conn.execute("SELECT status, lease_token FROM migrations WHERE id = %s", (migration_id,)).fetchone()
+    assert row == {"status": "SUCCEEDED", "lease_token": None}
+    assert events_of(conn, migration_id) == [
+        ("APPROVED", "EXECUTING", "worker:a"),
+        ("EXECUTING", "APPROVED", "reclaimer:b"),
+        ("APPROVED", "EXECUTING", "worker:b"),
+        ("EXECUTING", "SUCCEEDED", "worker:b"),
         # and nothing from worker:a after its claim
     ]
 

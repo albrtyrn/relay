@@ -72,7 +72,7 @@ relay/
 │   ├── __init__.py
 │   ├── config.py           reads env vars once into a frozen Settings dataclass
 │   ├── db.py               connect helpers (autocommit on) for relay_db and target_db
-│   ├── dbinit.py           `python -m relay.dbinit`: create databases and role, apply schema; `--reset` drops first
+│   ├── dbinit.py           `python -m relay.dbinit`: create databases and role, revoke CONNECT on the Relay database, apply schemas; `--reset` drops first
 │   ├── sqlhash.py          the one sha256 function
 │   ├── transitions.py      [core] transition helper and the table of legal (from, to) pairs
 │   ├── repo.py             create_migration insert and read queries (get, list, events)
@@ -88,7 +88,7 @@ relay/
 │       ├── __init__.py     Proposal, the two error types, LLMClient protocol, get_llm()
 │       └── fake.py         deterministic fake (groq.py arrives in Phase 2)
 ├── scripts/
-│   └── demo_crash.py       Phase 2; uses the same hook as the crash test
+│   └── demo_crash.py       M4 (D36); uses the same hook as the crash test, on its own demo databases
 └── tests/
     ├── conftest.py         database creation, per-test reset, shared fixtures
     ├── helpers.py          seed rows, expire_lease, run threads behind a Barrier, spawn a worker process
@@ -183,6 +183,7 @@ CREATE TABLE idempotency_keys (
 );
 
 -- The target role must not reach Relay's state.
+-- Run by dbinit, not kept in the schema file, because it names the database (D35).
 REVOKE CONNECT ON DATABASE relay_db FROM PUBLIC;
 ```
 
@@ -243,6 +244,8 @@ GRANT SELECT, INSERT ON relay_applied TO relay_migrator;
 ```
 
 What `relay_migrator` can do: alter, read, and write `customers` and `orders`; insert into and read `relay_applied`. What it cannot: create tables, touch `relay_applied` otherwise, connect to `relay_db`.
+
+`dbinit` runs this file only when `relay_applied` does not exist yet (or on `--reset`), because the file drops the tables first (D34). It sets the role's password on every run so the role follows `.env`.
 
 ---
 
@@ -349,7 +352,7 @@ FOR UPDATE SKIP LOCKED;
 
 `FOR UPDATE` locks the chosen row until commit. `SKIP LOCKED` makes other workers pass over a locked row instead of waiting for it.
 
-**M3 builds this with `WHERE status = 'PENDING'` only** (D32). The `APPROVED` half of the `WHERE`, and `APPROVED → EXECUTING`, arrive in M4 with the execute path. The same holds for the reclaim sweep in §4.5: M3 reclaims `DRAFTING` only.
+M3 built this with `WHERE status = 'PENDING'` only (D32). M4 widened it to the full query above, and the reclaim sweep in §4.5 to `EXECUTING`, when the execute path arrived. The `Claim` returned to the worker carries `proposed_sql` and `approved_sql_hash`, read under the claim's row lock, so the execute path needs no second read.
 
 Two properties this operation must have, both tested in `test_claim.py`:
 
@@ -373,6 +376,16 @@ Two properties this operation must have, both tested in `test_claim.py`:
 
 Checks before any target work, using the row returned by the claim (no lock held): `sha256(proposed_sql) == approved_sql_hash`, and `policy.validate(proposed_sql)` passes. Either failing → `EXECUTING → FAILED`, target untouched.
 
+Then, after the target connection is open and just before `BEGIN`, a lease re-check on Relay (one plain read, no lock; D33):
+
+```sql
+SELECT 1 FROM migrations
+WHERE id = %(id)s AND status = 'EXECUTING'
+  AND lease_token = %(my_token)s AND lease_expires_at > now();
+```
+
+No row → the pass ends as `lost`: nothing is written to the target or to Relay. This is stricter than D6 on purpose. D6 lets an owner *finish* (write) after expiry; it does not let one *start* target work on an expired lease.
+
 One transaction on `target_db`, connected as `relay_migrator`:
 
 ```sql
@@ -386,6 +399,7 @@ INSERT INTO relay_applied (migration_id, sql_hash)
 VALUES (%(id)s, %(approved_hash)s)
 ON CONFLICT (migration_id) DO NOTHING
 RETURNING migration_id;
+-- hooks.fire("execute.after_marker_insert")
 
 -- step "ddl": only if the INSERT returned a row
 <the exact approved SQL, as stored>
@@ -398,6 +412,8 @@ SELECT sql_hash FROM relay_applied WHERE migration_id = %(id)s;
 Then `hooks.fire("execute.after_target_commit")`, then a separate Relay transaction: `transition(EXECUTING → SUCCEEDED, lease_token = mine)`.
 
 `set_config(..., true)` is used instead of `SET LOCAL` because `SET` cannot take bound parameters.
+
+How the code tells a DDL failure from an unknown outcome: `apply_on_target` tracks which step it is on. It raises `DDLFailed` only when the error came from the DDL statement, carries a SQLSTATE, and afterwards the connection is alive and idle (the `ROLLBACK` was acknowledged). A session killed during the DDL also reports a SQLSTATE, so the third condition is what keeps it "unknown" (shown by a mutation check at M4).
 
 Outcomes:
 
@@ -496,7 +512,7 @@ FOR UPDATE SKIP LOCKED;
 
 ## 5. Worker loop
 
-`Worker(settings, llm, worker_id)` exposes `run_once() -> str` and `run_forever()`. `run_once` returns what the pass did: `idle`, `saved`, `failed`, `abandoned` (temporary error, lease left to expire), or `lost` (the final write matched 0 rows) (D31). Tests call `run_once`; the container runs `run_forever`. One long-lived Relay connection; a target connection is opened per execution.
+`Worker(settings, llm, worker_id)` exposes `run_once() -> str` and `run_forever()`. Constructing a `Worker` raises `ValueError` unless `LEASE_SECONDS > LOCK_TIMEOUT + STATEMENT_TIMEOUT + 10 s` (D33), so a misconfigured worker never claims a job. `run_once` returns what the pass did: `idle`, `saved`, `succeeded`, `failed`, `abandoned` (temporary error or unknown outcome, lease left to expire), or `lost` (the final write matched 0 rows, or the lease ran out before target work began) (D31). Tests call `run_once`; the container runs `run_forever`. One long-lived Relay connection; a target connection is opened per execution.
 
 ```
 run_once():
@@ -517,6 +533,7 @@ draft(claim):                                   # acts on PENDING jobs
 
 execute(claim):                                 # acts on APPROVED jobs
       check sha256(proposed_sql) == approved_sql_hash; policy.validate(proposed_sql)
+      open the target connection; re-check the lease on Relay (D33); expired or not mine -> "lost"
   T1  apply_on_target(...)                      # target txn, §4.3; no Relay txn open
       hooks.fire("execute.after_target_commit")
   R4  transition(EXECUTING -> SUCCEEDED or FAILED, token)     # Relay txn
@@ -617,7 +634,8 @@ To verify at M3 before writing the rules: print the parse tree for each allowed 
 ### 7.2 Database reset
 
 - **Once per session** (`conftest.py`): connect with `ADMIN_DSN`, drop and recreate `relay_test` and `target_test`, ensure `relay_migrator` exists, apply both schema files. Uses the same functions as `relay.dbinit`.
-- **Before every test** (autouse fixture): `TRUNCATE migrations, migration_events, idempotency_keys;` on `relay_test`, and re-run `db/target_schema.sql` on `target_test`. Truncating is not enough on the target because tests change table definitions.
+- **Before every test** (autouse fixture): `TRUNCATE migrations, migration_events, idempotency_keys;` on `relay_test`, and re-run `db/target_schema.sql` on `target_test` (`dbinit.apply_target_schema(..., force=True)`). Truncating is not enough on the target because tests change table definitions.
+- Fixtures: `target` is an admin connection to `target_test` for setup and for checking results; `migrator` is a connection as `relay_migrator`. The code under test only ever uses the latter login.
 - Reset happens before, not after, so a failed test's rows are still there to inspect and no test depends on leftovers.
 - Tests may `INSERT` a row in any state as setup (`helpers.seed_migration(status=...)`). They never `UPDATE` `status`.
 
@@ -656,11 +674,13 @@ Two ways to arm a hook:
 
 Crash tests: `helpers.spawn_worker(hook="execute.after_target_commit:crash")` starts `python -m relay.worker` as a subprocess, waits for it to exit with code 137 (`proc.wait(timeout=...)`), asserts the mid-crash state (marker present, Relay still `EXECUTING`), expires the lease, then runs a second worker's `run_once()` in-process and asserts the recovery.
 
-`demo_crash.py` (Phase 2) starts a worker with `...:pause`, waits for the marker to appear, kills the container, and shows a second worker finishing.
+`demo_crash.py` (built at M4, D36) starts a worker process with `execute.after_target_commit:pause`, waits for its `PAUSED at` line, shows the two databases disagreeing, kills the process with SIGKILL, and shows a second worker finishing once the lease has expired. It runs on its own databases (`relay_demo`, `target_demo`) with a real 15-second lease. Run it with `docker compose run --rm tests python -m scripts.demo_crash`. `test_worker_paused_after_target_commit_then_killed_is_recovered` asserts the same sequence.
 
 ### 7.6 Configuration (all from environment; `.env.example` lists each)
 
 `RELAY_DB_DSN`, `TARGET_DB_DSN` (as `relay_migrator`), `ADMIN_DSN` (dbinit and tests only), `TARGET_MIGRATOR_PASSWORD`, `WORKER_ID` (default hostname + pid), `LEASE_SECONDS=60`, `POLL_SECONDS=1`, `MAX_ATTEMPTS=5`, `LOCK_TIMEOUT=5s`, `STATEMENT_TIMEOUT=15s`, `TARGET_IDLE_TIMEOUT=30s`, `LLM_PROVIDER=fake`, `LLM_TIMEOUT_SECONDS=20`, `RELAY_HOOK` (unset outside tests and the demo).
+
+The three timeouts are written as a whole number followed by `ms`, `s`, or `min`. Relay accepts only that subset of Postgres's spellings so the startup check can read them the way Postgres will. **Startup rule (D33):** `LEASE_SECONDS > LOCK_TIMEOUT + STATEMENT_TIMEOUT + 10 s`, and neither timeout may be zero (zero disables it in Postgres). A worker that breaks the rule refuses to start.
 
 ### 7.7 Dependencies
 
@@ -783,6 +803,17 @@ Target schema and role, `target.py` [core], `worker.py` execute path, reclaim fo
 - `test_worker_contention.py::test_execution_50_jobs_4_workers` (all 50 `SUCCEEDED`; 50 markers; 50 new columns)
 - `test_retry_limit.py::test_execution_at_limit_with_marker_succeeds`
 - `test_retry_limit.py::test_execution_at_limit_without_marker_fails`
+- Added while building M4:
+  - `test_execute.py::test_no_relay_transaction_is_open_during_target_work` (invariant 2)
+  - `test_execute.py::test_expired_lease_before_target_work_leaves_target_untouched` (D33)
+  - `test_execute.py::test_owner_can_mark_succeeded_after_expiry_if_not_yet_reclaimed` (D6)
+  - `test_execute.py::test_timeouts_apply_inside_the_target_transaction_only`
+  - `test_execute.py::test_apply_on_target_raises_ddl_failed_and_connection_stays_usable`
+  - `test_crash_after_target_commit.py::test_worker_paused_after_target_commit_then_killed_is_recovered` (the `:pause` hook; what the demo shows)
+  - `test_claim.py::test_claim_ignores_rows_that_are_not_queued` (replaces the M3 "not pending" test), `test_claim_of_approved_row_sets_executing_and_carries_the_approved_sql`, `test_one_queue_serves_both_phases_oldest_first`
+  - `test_config.py` (D33: the lease rule, the timeout format, `load_settings`)
+  - `test_dbinit_target.py` (D34: no rebuild of an existing target; forced rebuild restores it)
+- `scripts/demo_crash.py` (D36), run by hand.
 
 ### M5: Idempotency keys
 
@@ -802,7 +833,7 @@ Target schema and role, `target.py` [core], `worker.py` execute path, reclaim fo
 
 - **Live-HTTP concurrency test:** 20 real approve requests against a running `api` container. Until it exists, the README rule in §10 applies.
 - Retry `lock_timeout` automatically? Revisit D9 with the Phase 2 `lock_timeout` test.
-- PLAN's own Phase 2 list: Groq adapter, CI, structured logs, `demo_crash.py`, GIF.
+- PLAN's own Phase 2 list: Groq adapter, CI, structured logs, GIF. (`demo_crash.py` was pulled into M4, D36.)
 - Future work beyond Phase 2: target-side fencing (D23).
 
 ---
@@ -833,7 +864,8 @@ Target schema and role, `target.py` [core], `worker.py` execute path, reclaim fo
 | D20 | `risk_level` comes from the LLM and gates nothing | Compute risk in code; block on `HIGH` | The policy already decides what may run. Risk is reviewer context only. |
 | D21 | Reject reason and failure text live in `migration_events.detail` (failure text also in `migrations.error`) | A `reject_reason` column | One generic field on the audit row instead of a column per outcome. |
 | D22 | Python 3.12 (`python:3.12-slim`) | Python 3.13, which PLAN gives as an example | CLAUDE.md's approved stack names 3.12, and pglast 8.8 has `cp312` wheels for x86_64 and aarch64 Linux, so neither machine needs a compiler in the image. |
-| D23 | **Future work, not built.** The late-apply gap (§1 #5) stays a documented non-guarantee in v1. The real fix is a fencing check enforced inside target_db: every claim gets a number that only ever increases (a new counter, since `attempts` resets); target_db keeps the highest number seen per migration in a table the migrator can only raise; the target transaction's first statement raises it to its own number and aborts if a higher one is already there. A worker about to mark `FAILED` first raises the fence, so an older attempt that wakes up later is refused by the target itself. | Build it now; rely on the lease token alone; narrow the window with timeouts only (what v1 does) | The lease token is checked by Relay, not by the target, so it cannot stop a stale worker there. Fencing needs a second target table, a new counter, and its own crash tests: too much for the v1 sprint. The README must list late apply as a non-guarantee. |
+| D23 | **Future work, not built.** The late-apply gap (§1 #5) stays a documented non-guarantee in v1. The real fix is a fencing check enforced inside target_db: every claim gets a number that only ever increases (a new counter, since `attempts` resets); target_db keeps the highest number seen per migration in a table the migrator can only raise; the target transaction's first statement raises it to its own number and aborts if a higher one is already there. A worker about to mark `FAILED` first raises the fence, so an older attempt that wakes up later is refused by the target itself. | Build it now; rely on the lease token alone; narrow the window with timeouts only (what v1 does) | The lease token is checked by Relay, not by the target, so it cannot stop a stale worker there. Fencing needs a second target table, a new counter, and its own crash tests: too much for the v1 sprint. The README must list late apply as a non-guarantee. **Narrowed, not closed, by D33** (lease longer than the target timeouts, checked at startup; lease re-check before the target transaction). |
+| D33 | **Accepted 2026-11-16 (M4). Narrows the late-apply gap of D23; does not close it.** Two checks. (a) At startup a worker refuses to run unless `LEASE_SECONDS > LOCK_TIMEOUT + STATEMENT_TIMEOUT + 10 s` (and neither timeout is zero), so a healthy worker's lease outlasts its target transaction. (b) Just before the target transaction the worker re-reads its row and requires its own token, status `EXECUTING`, **and an unexpired lease**; otherwise the pass ends as `lost` with the target untouched. | Trust the defaults (§1 #9) with no check; re-check token and status only; make the margin configurable | A lease shorter than the work makes every slow-but-healthy execution a stale worker. Starting target work on an expired lease is exactly the late-apply case, while D6 (accept a late *write*) stays true for finishing. A configurable margin is a knob for weakening a safety check. What remains open: a worker frozen after check (b) and before its target commit can still apply late; only fencing inside the target (D23) stops that. Tested in `test_config.py` and `test_expired_lease_before_target_work_leaves_target_untouched`. |
 | D24 | **Added at M1.** `.env.example` and `Settings` list only the variables a milestone actually reads (M1: `POSTGRES_USER`, `POSTGRES_PASSWORD`; Compose assembles `RELAY_DB_DSN` and `ADMIN_DSN` from them). `dbinit` applies `relay_schema.sql` only when `migrations` does not exist yet, and creates an empty `target_db`; the target schema and `relay_migrator` role wait for M4 | List every §7.6 variable in `.env.example` from M1; run the schema on every `dbinit`; build the target schema and role in M1 | Unread variables are noise for someone learning the code, and the target role has nothing to guard until M4 (DESIGN §8 puts it there). Skip-if-present is what makes `docker compose up` safe to repeat while the volume lives on. Cost: a schema change needs `--reset` (already D17). |
 | D25 | **Added at M1.** The API never returns `lease_token` or `lease_expires_at`. `repo.PUBLIC_COLUMNS` is an explicit column list, not `SELECT *` | Return every column | The lease token is a worker's proof of ownership (invariant 3). Anyone who can read it from `GET /migrations/{id}` could write as that worker. Tested in `test_get_hides_lease_fields`. |
 | D26 | **Added at M1.** `POST /migrations` rejects unknown body fields (`extra="forbid"`) and strips whitespace from `description` before the 1..2000 length check; `X-User` is capped at 195 characters | Ignore extra fields; store the description untouched; no cap on `X-User` | v1 takes a description only, so a client sending `proposed_sql` should hear "no" rather than be silently ignored. A whitespace-only description is empty in practice. 195 + the `user:` prefix equals the 200-character limit on `migration_events.actor`. |
@@ -843,6 +875,11 @@ Target schema and role, `target.py` [core], `worker.py` execute path, reclaim fo
 | D30 | **Accepted 2026-11-16 (M3).** The retry limit counts per phase, not per job: a successful draft (R3) resets `attempts` to 0, so drafting and execution each get `MAX_ATTEMPTS` claims | One counter for the whole job, never reset; two separate counter columns | Drafting and execution fail for unrelated reasons (the LLM vs. the target database), so a job that needed four tries to draft should not reach execution with one try left. One column that resets is simpler than two, and the full history is still in `migration_events`. Cost: one job can use up to 2 × `MAX_ATTEMPTS` claims in total. |
 | D31 | **Added at M3.** `run_once()` returns an outcome string (`idle`, `saved`, `failed`, `abandoned`, `lost`) instead of a bool, and `claim.after_commit` fires only when a claim was made | `-> bool` ("did anything") as first written in §5; firing the hook on every pass | Tests need to assert that a stale worker's pass ended as `lost`, not just that it "did something". A crash hook that fired with no claim would kill a worker that was merely idle. |
 | D32 | **Accepted 2026-11-16 (M3).** Until M4 the claim takes only `PENDING` rows and reclaim handles only `DRAFTING` | Build §4.2's full `WHERE status IN ('PENDING', 'APPROVED')` now | The execute path does not exist yet. A worker that claimed an approved job would have nothing to do with it, and the job would cycle between `EXECUTING` and `APPROVED` until the retry limit failed it. |
+
+| D34 | **Accepted 2026-11-16 (M4).** `dbinit` runs `db/target_schema.sql` only when `relay_applied` does not exist (or on `--reset`); tests force it before every test. It sets `relay_migrator`'s password on every run | Run the file on every `docker compose up`; split it into a "create" file and a "reset" file | The file drops the demo tables and the markers first, so re-running it would erase applied migrations while Relay still says `SUCCEEDED`. One file that is both schema and reset is less to keep in step. Same skip-if-present rule as the relay schema (D24). |
+| D35 | **Accepted 2026-11-16 (M4).** `REVOKE CONNECT ON DATABASE <relay db> FROM PUBLIC` is run by `dbinit`, with the real database name, on every run | Keep the line in `relay_schema.sql` as §3.1 first showed | The statement names the database, and tests use `relay_test`. The schema file is also skipped when the tables exist (D24), so an existing dev volume would never have received the line. |
+| D36 | **Accepted 2026-11-16 (M4).** `scripts/demo_crash.py` is built in M4, not Phase 2. It kills a worker *subprocess* with SIGKILL, runs on its own `relay_demo` / `target_demo` databases, and waits out a real 15-second lease (with `LOCK_TIMEOUT=1s`, `STATEMENT_TIMEOUT=2s` to satisfy D33) | Phase 2 (PLAN); kill a Compose container; run on the dev databases; backdate the lease as tests do | Albert asked for it with M4. A subprocess needs no Docker socket inside the container and dies the same way. On the dev databases the two Compose workers would race the demo for its job. A demo should show the real wait; tests are where time is faked. |
+| D37 | **Added at M4.** `run_once()` gains the outcome `succeeded`, and `lost` also covers "my lease ran out before target work began" (extends D31) | Reuse `saved` for a finished execution; a separate `expired` outcome | Tests and the demo need to tell a draft saved from a migration applied. In both `lost` cases the worker does the same thing: stop and write nothing. |
 
 ---
 

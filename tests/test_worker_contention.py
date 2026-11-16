@@ -1,13 +1,14 @@
 """Several workers draining one queue at the same time (DESIGN.md section 8).
 
-M3 covers generation; the execution case arrives in M4.
+One test for generation (M3) and one for execution (M4).
 """
 
 from collections import Counter
 
 from relay import worker
 from relay.llm.fake import FakeLLM
-from tests.helpers import CountingLLM, run_behind_barrier, seed_migration
+from relay.sqlhash import sha256_hex
+from tests.helpers import CountingLLM, columns_of, markers_of, run_behind_barrier, seed_migration
 
 
 def test_generation_50_jobs_4_workers(conn, settings, make_worker):
@@ -58,4 +59,63 @@ def test_generation_50_jobs_4_workers(conn, settings, make_worker):
 
     assert Counter(llm.calls) == {description: 1 for description in descriptions}
     # Exactly two events per job (claim, save): no reclaims and no duplicate saves.
+    assert conn.execute("SELECT count(*) AS n FROM migration_events").fetchone()["n"] == 100
+
+
+def test_execution_50_jobs_4_workers(conn, target, settings, make_worker):
+    """Guarantee: 4 workers released together over 50 APPROVED jobs bring all 50 to
+    SUCCEEDED, with exactly one marker per job (carrying that job's approved hash) and
+    exactly the 50 new columns on the target.
+
+    Invariant: 3 (each job is claimed once: one APPROVED -> EXECUTING event per job) and 4
+    (each job's DDL took effect once: one marker each, and a second run of any ADD COLUMN
+    would have failed as a duplicate and left a FAILED job). The race is forced with a
+    Barrier. The 4 workers are threads with their own Relay and target connections; every
+    job adds a different column, split across the two demo tables.
+    """
+    jobs = {}       # migration id -> (table, column, sql)
+    for n in range(50):
+        table = "customers" if n % 2 == 0 else "orders"
+        sql = f"ALTER TABLE public.{table} ADD COLUMN c{n} text"
+        jobs[seed_migration(conn, status="APPROVED", sql=sql)] = (table, f"c{n}", sql)
+    before = {table: columns_of(target, table) for table in ("customers", "orders")}
+    workers = [make_worker(f"w{n}") for n in range(4)]
+
+    def drain(one_worker):
+        def action(_unused_conn):
+            outcomes = []
+            while (outcome := one_worker.run_once()) != worker.IDLE:
+                outcomes.append(outcome)
+            return outcomes
+        return action
+
+    per_worker = run_behind_barrier(settings.relay_db_dsn, [drain(w) for w in workers])
+
+    outcomes = [outcome for outcomes in per_worker for outcome in outcomes]
+    assert Counter(outcomes) == {worker.SUCCEEDED: 50}
+
+    rows = conn.execute("SELECT id, status, lease_token, attempts, error FROM migrations").fetchall()
+    assert {row["id"] for row in rows} == set(jobs)
+    assert all(
+        (row["status"], row["lease_token"], row["attempts"], row["error"]) == ("SUCCEEDED", None, 1, None)
+        for row in rows
+    )
+
+    # Exactly one marker per job, each with that job's approved hash.
+    assert markers_of(target) == {migration_id: sha256_hex(sql) for migration_id, (_, _, sql) in jobs.items()}
+
+    # Exactly the 50 new columns, each on the table its job named.
+    for table in ("customers", "orders"):
+        expected_new = {column for (job_table, column, _) in jobs.values() if job_table == table}
+        assert columns_of(target, table) - before[table] == expected_new
+
+    claim_events = conn.execute(
+        """
+        SELECT migration_id, count(*) AS n FROM migration_events
+        WHERE from_status = 'APPROVED' AND to_status = 'EXECUTING'
+        GROUP BY migration_id
+        """
+    ).fetchall()
+    assert {row["migration_id"]: row["n"] for row in claim_events} == {migration_id: 1 for migration_id in jobs}
+    # Exactly two events per job (claim, success): no reclaims and no duplicate writes.
     assert conn.execute("SELECT count(*) AS n FROM migration_events").fetchone()["n"] == 100

@@ -27,17 +27,28 @@ SEED_HASH = sha256_hex(SEED_SQL)
 THREAD_TIMEOUT = 10
 
 
-def seed_migration(conn, status: str = "PENDING", description: str = "seeded row") -> uuid.UUID:
+def seed_migration(
+    conn,
+    status: str = "PENDING",
+    description: str = "seeded row",
+    *,
+    sql: str = SEED_SQL,
+    approved_hash: str | None = None,
+) -> uuid.UUID:
     """Insert a row directly in any status and return its id.
 
     This is test setup, not application behavior: it bypasses the API and writes no audit
     event. Tests may INSERT a row in any state this way but never UPDATE status
     (DESIGN.md section 7.2).
+
+    `sql` is the stored proposal (M4 tests give each job its own column). `approved_hash`
+    defaults to the hash of `sql`; pass another value to seed a row whose stored SQL no
+    longer matches what was approved.
     """
     has_proposal = status in _NEEDS_PROPOSAL
     has_approval = status in _NEEDS_APPROVAL
     has_lease = status in _NEEDS_LEASE
-    sql_hash = sha256_hex(SEED_SQL)
+    sql_hash = sha256_hex(sql)
     row = conn.execute(
         """
         INSERT INTO migrations (description, status, proposed_sql, proposed_sql_hash,
@@ -49,9 +60,9 @@ def seed_migration(conn, status: str = "PENDING", description: str = "seeded row
         {
             "description": description,
             "status": status,
-            "sql": SEED_SQL if has_proposal else None,
+            "sql": sql if has_proposal else None,
             "proposed_hash": sql_hash if has_proposal else None,
-            "approved_hash": sql_hash if has_approval else None,
+            "approved_hash": (approved_hash or sql_hash) if has_approval else None,
             "token": uuid.uuid4() if has_lease else None,
             # A far-future timestamp: nothing in M1 looks at it, and M3 tests backdate it.
             "expires": "2999-01-01T00:00:00Z" if has_lease else None,
@@ -183,6 +194,73 @@ class FlakyLLM:
         return self._inner.propose(description, schema_summary)
 
 
+def columns_of(target, table: str) -> set[str]:
+    """The column names of a demo table on the target database, as it is right now."""
+    rows = target.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = %s",
+        (table,),
+    ).fetchall()
+    return {row["column_name"] for row in rows}
+
+
+def markers_of(target) -> dict:
+    """Every marker on the target: {migration_id: sql_hash}. The primary key on migration_id
+    means there can never be two markers for one migration."""
+    rows = target.execute("SELECT migration_id, sql_hash FROM relay_applied").fetchall()
+    return {row["migration_id"]: row["sql_hash"] for row in rows}
+
+
+def insert_marker(target, migration_id, sql_hash: str) -> None:
+    """Test setup: put a marker on the target as if an earlier attempt had committed there."""
+    target.execute(
+        "INSERT INTO relay_applied (migration_id, sql_hash) VALUES (%s, %s)", (migration_id, sql_hash)
+    )
+
+
+def events_of(conn, migration_id) -> list[tuple]:
+    """The audit trail of one migration, oldest first, as (from, to, actor) tuples."""
+    rows = conn.execute(
+        "SELECT from_status, to_status, actor FROM migration_events WHERE migration_id = %s ORDER BY id",
+        (migration_id,),
+    ).fetchall()
+    return [(row["from_status"], row["to_status"], row["actor"]) for row in rows]
+
+
+def raise_once(message: str):
+    """A hook function that raises RuntimeError the first time it runs and does nothing after.
+
+    Stands in for "the worker died at this line" in single-process tests: the exception leaves
+    `run_once` without any further write, exactly what a dead worker would have written.
+    (Real process deaths are tested with `spawn_worker`.)
+    """
+    already_raised = []
+
+    def hook():
+        if already_raised:
+            return
+        already_raised.append(True)
+        raise RuntimeError(message)
+
+    return hook
+
+
+def read_until(process: subprocess.Popen, text: str) -> str:
+    """Read a worker process's output until a line contains `text`; return everything read.
+
+    Runs in a Background thread so a worker that never prints the line fails the test after
+    THREAD_TIMEOUT instead of hanging it.
+    """
+    def read():
+        seen = []
+        for line in process.stdout:
+            seen.append(line)
+            if text in line:
+                return "".join(seen)
+        raise AssertionError(f"worker exited without printing {text!r}; output:\n{''.join(seen)}")
+
+    return Background(read).join()
+
+
 def spawn_worker(settings, worker_id: str, hook: str) -> subprocess.Popen:
     """Start a real worker process (`python -m relay.worker`) against the test database.
 
@@ -192,6 +270,7 @@ def spawn_worker(settings, worker_id: str, hook: str) -> subprocess.Popen:
     env = {
         **os.environ,
         "RELAY_DB_DSN": settings.relay_db_dsn,
+        "TARGET_DB_DSN": settings.target_db_dsn,
         "WORKER_ID": worker_id,
         "RELAY_HOOK": hook,
     }

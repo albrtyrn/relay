@@ -1,7 +1,8 @@
-"""Lease-expiry reclaim, drafting cases (DESIGN.md section 4.5, M3).
+"""Lease-expiry reclaim (DESIGN.md section 4.5; drafting in M3, executing in M4).
 
 A lease is a time-limited claim. When it runs out without the job finishing (the worker
-crashed, hung, or gave up), any worker may return the job to the queue: DRAFTING -> PENDING.
+crashed, hung, or gave up), any worker may return the job to the queue it came from:
+DRAFTING -> PENDING, or EXECUTING -> APPROVED.
 """
 
 from relay import hooks, worker
@@ -42,22 +43,43 @@ def test_expired_drafting_returns_to_pending_with_reclaimer_event(conn):
     assert events_of(conn, migration_id) == [("DRAFTING", "PENDING", "reclaimer:w2")]
 
 
+def test_expired_executing_returns_to_approved(conn):
+    """Guarantee: an EXECUTING row whose lease has expired goes back to APPROVED (not to
+    PENDING, and not to FAILED) with its lease cleared, its approval kept, and a reclaimer
+    event in the audit log.
+
+    Invariant: 1 and 3, as for drafting. Reclaim never judges the earlier attempt: it cannot
+    know whether the dead worker committed on the target. It only puts the job back in the
+    queue; the next worker's marker insert finds out (DESIGN.md section 4.5).
+    """
+    migration_id = seed_migration(conn, status="EXECUTING")
+    expire_lease(conn, migration_id)
+
+    reclaimed = reclaim_expired(conn, "w2")
+
+    assert reclaimed == 1
+    assert row_of(conn, migration_id) == {
+        "status": "APPROVED", "lease_token": None, "lease_expires_at": None, "attempts": 0,
+    }
+    assert events_of(conn, migration_id) == [("EXECUTING", "APPROVED", "reclaimer:w2")]
+    approved = conn.execute("SELECT approved_sql_hash FROM migrations WHERE id = %s", (migration_id,)).fetchone()
+    assert approved["approved_sql_hash"] is not None
+
+
 def test_unexpired_lease_is_not_reclaimed(conn):
-    """Guarantee: a lease that has not expired is left alone, and so are EXECUTING rows (M4).
+    """Guarantee: a lease that has not expired is left alone, in both leased states.
 
     Invariant: 3. A live lease means a worker may still be working; taking the job away
     would create two owners.
     """
-    live = seed_migration(conn, status="DRAFTING")          # seeded with a far-future expiry
+    drafting = seed_migration(conn, status="DRAFTING")      # seeded with a far-future expiry
     executing = seed_migration(conn, status="EXECUTING")
-    expire_lease(conn, executing)                            # expired, but reclaimed only from M4
-    before = row_of(conn, live)
+    before = (row_of(conn, drafting), row_of(conn, executing))
 
     reclaimed = reclaim_expired(conn, "w2")
 
     assert reclaimed == 0
-    assert row_of(conn, live) == before
-    assert row_of(conn, executing)["status"] == "EXECUTING"
+    assert (row_of(conn, drafting), row_of(conn, executing)) == before
     assert conn.execute("SELECT count(*) AS n FROM migration_events").fetchone()["n"] == 0
 
 

@@ -7,6 +7,10 @@ x-relay-env: &relay-env
   # A password containing @ : / ? # would need URL-encoding here.
   RELAY_DB_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/relay_db
   ADMIN_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/postgres
+  # The worker logs in to the target as relay_migrator, a role with only the rights it needs.
+  # dbinit creates that role with this password.
+  TARGET_DB_DSN: postgresql://relay_migrator:${TARGET_MIGRATOR_PASSWORD:?set it in .env}@postgres:5432/target_db
+  TARGET_MIGRATOR_PASSWORD: ${TARGET_MIGRATOR_PASSWORD:?set it in .env}
 
 services:
   postgres:
@@ -25,8 +29,8 @@ services:
       timeout: 3s
       retries: 30
 
-  # Creates target_db if missing and applies db/relay_schema.sql if relay_db has no tables yet.
-  # Safe to run on every `up`: it never drops anything (only `--reset` does).
+  # Creates what is missing: target_db, the relay_migrator role, the relay schema, and the
+  # target schema. Safe to run on every `up`: it never drops anything (only `--reset` does).
   dbinit:
     build: .
     command: ["python", "-m", "relay.dbinit"]
@@ -47,7 +51,8 @@ services:
 
   # Two worker processes drain the same queue (CLAUDE.md: "Workers (2+ processes)").
   # Each gets its own WORKER_ID by default: container host name plus process id.
-  # M3: they draft proposals (PENDING -> WAITING_FOR_APPROVAL). Execution arrives in M4.
+  # They draft proposals (PENDING -> WAITING_FOR_APPROVAL) and run approved ones on target_db
+  # (APPROVED -> SUCCEEDED or FAILED).
   worker:
     build: .
     init: true # forwards SIGTERM so `docker compose down` stops the worker promptly
