@@ -1,8 +1,8 @@
 # Relay: build blueprint
 
-This file says how to build what PLAN.md describes. PLAN.md stays the source for *what* and *why*; where the two disagree, §1 lists the disagreement and the proposed fix. Nothing in §1 is final until Albert accepts it.
+This file says how to build what PLAN.md describes. PLAN.md stays the source for *what* and *why*; where the two disagree, §1 lists the disagreement and the resolution. All §1 resolutions were accepted by Albert on 2026-11-16.
 
-Code marked **[Albert]** is one of the four pieces Albert writes himself. The SQL here is the spec for it, not an implementation.
+Code marked **[core]** is one of the four core operations. Each gets a header comment in the code stating its precondition, its atomic operation, how it fails, and the invariant it protects (CLAUDE.md, "Make it teachable"). The SQL here is the spec those implementations must match.
 
 Conventions used everywhere below:
 
@@ -16,13 +16,15 @@ Conventions used everywhere below:
 
 ## 1. Spec issues
 
-| # | Issue in PLAN.md | Proposed resolution |
+**Status: all 25 resolutions accepted (Albert, 2026-11-16).** They are now part of the spec.
+
+| # | Issue in PLAN.md | Resolution (accepted) |
 | --- | --- | --- |
 | 1 | **Idempotency-Key timing.** The endpoint table says approve/reject *require* the key, but the roadmap builds approve on Day 12 and idempotency on Days 20–21. The same table says `POST /migrations` gets a key "in Phase 2", but the Phase 2 list does not mention it. | Approve/reject: header is accepted and ignored in M2–M4, required from M5 (missing → `422`). `POST /migrations`: no key in v1 or Phase 2; a duplicate create only makes a second `PENDING` row that a reviewer rejects. Remove "added in Phase 2" from the table. |
-| 2 | **No retry limit in v1.** A job that crashes its worker every time is reclaimed forever. | Pull a minimal limit forward: `MAX_ATTEMPTS` (default 5), enforced by the worker that claims the job (§5), in M3 for generation and M4 for execution. Needs Albert's OK because PLAN puts it in Phase 2. |
+| 2 | **No retry limit in v1.** A job that crashes its worker every time is reclaimed forever. | Pull a minimal limit forward: `MAX_ATTEMPTS` (default 5), enforced by the worker that claims the job (§5), in M3 for generation and M4 for execution, although PLAN lists it under Phase 2 (D8). |
 | 3 | **Invariant 1 vs. the claim query.** "Nothing else writes `status`", yet PLAN's claim is its own `UPDATE ... RETURNING` that changes status. | Claim = `SELECT ... FOR UPDATE SKIP LOCKED` to pick and lock the row, then the transition helper in the same transaction (§4.2). The helper stays the only `UPDATE` of `status`. The initial `INSERT` (status `PENDING`) is the one allowed non-helper write. |
 | 4 | **Invariant 3 vs. reclaim.** The "lease expires" edges are written by a worker that does not own the lease. | Reclaim goes through the helper, guarded by the *expired* token it just read plus `lease_expires_at < now()` under a row lock (§4.5). |
-| 5 | **`FAILED` does not prove the target is unchanged.** A stale worker frozen before its target transaction can wake up and apply the DDL after another worker marked the job `FAILED`. The marker stops a double apply, not a late one. | Document as a non-guarantee. Narrow it with `idle_in_transaction_session_timeout` on the target transaction and a lease re-check just before it. Closing it fully needs a tombstone marker; out of scope. |
+| 5 | **`FAILED` does not prove the target is unchanged.** A stale worker frozen before its target transaction can wake up and apply the DDL after another worker marked the job `FAILED`. The marker stops a double apply, not a late one. | Document as a non-guarantee. Narrow it with `idle_in_transaction_session_timeout` on the target transaction and a lease re-check just before it. Closing it fully needs a fencing check inside target_db (D23); future work, not built. |
 | 6 | **`lock_timeout` also applies to the marker insert.** A second worker waiting on the first worker's uncommitted marker can time out. That is contention, not a failed migration. | Errors are classified by step: marker step → retry; DDL step → `FAILED` (§4.3). |
 | 7 | **Timeout outcome unspecified.** PLAN says "SQL error → FAILED" but not whether `lock_timeout` / `statement_timeout` on the DDL retries. | `FAILED` in v1. Simple and deterministic; a human resubmits. |
 | 8 | **Lost commit acknowledgement.** If the connection drops during the target `COMMIT`, the worker cannot know the outcome. | Never mark `FAILED` on an unknown outcome. Abandon the lease; the next worker's marker insert reveals what happened. |
@@ -42,6 +44,7 @@ Conventions used everywhere below:
 | 22 | **Roadmap order.** PLAN builds claim (Days 8–10) before approve (Day 12); this blueprint's M2 is approve/reject and M3 is claim. | Follow M1–M5. Tests in M2 seed rows directly in `WAITING_FOR_APPROVAL`. |
 | 23 | **Compose only creates `relay_db`.** PLAN wants `target_db` in the same container. | A `dbinit` step creates databases, the role, and the schema (§2, §3). |
 | 24 | **Code vs. docs:** README hard-codes `psql -U relay`, but the user comes from `.env`. | Fix the README line at M1. |
+| 25 | **Python version.** PLAN says "e.g. `python:3.13-slim`"; CLAUDE.md's approved stack says Python 3.12. | Python 3.12 (`python:3.12-slim`, exact tag pinned at M1). pglast 8.8 ships `cp312` manylinux wheels for both x86_64 and aarch64 (checked on PyPI, 2026-11-16). PLAN's line is an example, not a requirement; update it when PLAN is next edited. |
 
 ---
 
@@ -59,7 +62,7 @@ relay/
 ├── .gitattributes          forces LF line endings
 ├── .gitignore
 ├── docker-compose.yml      postgres, dbinit, api, worker, tests
-├── Dockerfile              one pinned Python image for api, worker, dbinit, tests
+├── Dockerfile              one pinned Python 3.12 image for api, worker, dbinit, tests
 ├── requirements.txt        exact pinned versions
 ├── pytest.ini              test paths and markers
 ├── db/
@@ -71,13 +74,13 @@ relay/
 │   ├── db.py               connect helpers (autocommit on) for relay_db and target_db
 │   ├── dbinit.py           `python -m relay.dbinit`: create databases and role, apply schema; `--reset` drops first
 │   ├── sqlhash.py          the one sha256 function
-│   ├── transitions.py      [Albert] transition helper and the table of legal (from, to) pairs
+│   ├── transitions.py      [core] transition helper and the table of legal (from, to) pairs
 │   ├── repo.py             create_migration insert and read queries (get, list, events)
 │   ├── service.py          approve/reject decisions (404/409) with no HTTP in it
-│   ├── idempotency.py      [Albert] key reservation and replay (M5)
+│   ├── idempotency.py      [core] key reservation and replay (M5)
 │   ├── api.py              FastAPI app, routes, Pydantic models, error mapping
-│   ├── claim.py            [Albert] claim query; also the reclaim sweep
-│   ├── target.py           [Albert] marker-first target transaction (M4)
+│   ├── claim.py            [core] claim query; also the reclaim sweep
+│   ├── target.py           [core] marker-first target transaction (M4)
 │   ├── policy.py           pglast allow-list (§6.2)
 │   ├── hooks.py            named pause/crash points for tests and the demo (§7.5)
 │   ├── worker.py           worker loop, draft step, execute step; `python -m relay.worker`
@@ -245,7 +248,7 @@ What `relay_migrator` can do: alter, read, and write `customers` and `orders`; i
 
 ## 4. The four core operations and reclaim
 
-### 4.1 Transition helper **[Albert]** (M2)
+### 4.1 Transition helper **[core]** (M2)
 
 `transition(conn, migration_id, from_status, to_status, actor, *, lease_token=None, detail=None, set_fields=None) -> bool`
 
@@ -299,7 +302,7 @@ Legal transitions and what each sets:
 | **Crash after commit** | Both are durable. The caller may never see the answer: the API client retries and gets `409` (a replay after M5); for a worker, the lease or the next state handles it. |
 | **Invariant** | 1 (single writer of `status`), 3 (token check, atomic with the audit event). |
 
-### 4.2 Claim query **[Albert]** (M3)
+### 4.2 Claim query **[core]** (M3)
 
 `claim_one(conn, worker_id, lease_seconds) -> Claim | None`. One transaction:
 
@@ -322,7 +325,12 @@ FOR UPDATE SKIP LOCKED;
 -- COMMIT
 ```
 
-`FOR UPDATE` locks the chosen row until commit. `SKIP LOCKED` makes other workers pass over a locked row instead of waiting for it. The function returns only after the commit, so no lock is held during the work.
+`FOR UPDATE` locks the chosen row until commit. `SKIP LOCKED` makes other workers pass over a locked row instead of waiting for it.
+
+Two properties this operation must have, both tested in `test_claim.py`:
+
+- **The lease is set by the helper, in the same `UPDATE` as the status change.** `lease_token`, `lease_expires_at`, and `attempts` travel in `set_fields`, so status, lease, and audit event commit together. There is never a committed `DRAFTING`/`EXECUTING` row without a lease (the `lease_matches_status` CHECK would reject it anyway).
+- **The claim commits before any LLM or target work.** `claim_one` returns only after `COMMIT`. The caller holds no transaction and no row lock when it calls the LLM or opens the target connection.
 
 | | |
 | --- | --- |
@@ -335,7 +343,7 @@ FOR UPDATE SKIP LOCKED;
 | **Invariant** | 2 (commit before work) and 3 (the fresh token is the proof of ownership for later writes). |
 | **Does not guarantee** | Strict oldest-first order under contention, or that a job is processed once. `SKIP LOCKED` only prevents two *simultaneous* claims; the lease and the marker cover everything after the commit. |
 
-### 4.3 Target marker transaction **[Albert]** (M4)
+### 4.3 Target marker transaction **[core]** (M4)
 
 `apply_on_target(target_conn, migration_id, approved_sql, approved_hash, settings) -> APPLIED | ALREADY_APPLIED | HASH_MISMATCH`, or raises `DDLFailed`.
 
@@ -390,7 +398,7 @@ Outcomes:
 | **0 rows on the final Relay write** | Lease was lost. Stop. Whoever holds the job now will find the marker. |
 | **Invariant** | 4 (marker first, same transaction, hash must match), and the "no transaction spans both databases" rule. |
 
-### 4.4 Idempotency reservation **[Albert]** (M5)
+### 4.4 Idempotency reservation **[core]** (M5)
 
 Wraps approve and reject. `request_hash = sha256(canonical JSON of {"migration_id": ..., "body": ...})` with sorted keys.
 
@@ -637,18 +645,18 @@ Crash tests: `helpers.spawn_worker(hook="execute.after_target_commit:crash")` st
 | --- | --- | --- |
 | `fastapi`, `uvicorn` | API and its server | (stack) |
 | `psycopg[binary]` | Postgres driver with prebuilt wheels for x64 and ARM64 Linux | building from source needs a compiler in the image |
-| `pglast` | real Postgres parser for the policy. 8.8 has Linux wheels for x86_64 and aarch64 on Python 3.13 (checked on PyPI, Nov 2026) | regex on SQL, which is exactly what the policy must not be |
+| `pglast` | real Postgres parser for the policy. 8.8 has `cp312` manylinux wheels for x86_64 and aarch64 (checked on PyPI, 2026-11-16) | regex on SQL, which is exactly what the policy must not be |
 | `pytest` | test runner | (stack) |
 | `httpx` | required by FastAPI's `TestClient` | running a live server for every HTTP test |
-| `pytest-repeat` | `--count=20` to hunt rare interleavings | a shell loop |
+| `pytest-repeat` | `--count=20` to hunt rare interleavings. **Not in CLAUDE.md's approved stack: do not install until Albert approves.** | a shell loop running pytest 20 times |
 
-Not added: a connection pool, an ORM, a migration tool, `pytest-timeout`, `pydantic-settings`. Exact versions are pinned when M1 builds the image.
+Not added: an ORM, a migration tool, `pytest-timeout`, `pydantic-settings`. `psycopg_pool` is approved in CLAUDE.md but unused under D16 (open question). Runtime is Python 3.12. Exact versions are pinned when M1 builds the image.
 
 ---
 
 ## 8. Build order
 
-A milestone is done when every listed test passes via `docker compose run --rm tests pytest`, and Albert can explain each line kept.
+A milestone is done when every listed test passes via `docker compose run --rm tests pytest`, every test has a docstring naming the guarantee it proves, and PROGRESS.md is updated.
 
 ### M1: Scaffolding
 
@@ -672,7 +680,7 @@ Dockerfile, Compose (postgres healthcheck, `dbinit`, `api`, `tests`), `config.py
 
 ### M2: Transition helper, approve, reject
 
-`transitions.py` [Albert], `service.py`, approve and reject endpoints (`Idempotency-Key` accepted, ignored).
+`transitions.py` [core], `service.py`, approve and reject endpoints (`Idempotency-Key` accepted, ignored).
 
 - `test_transitions.py::test_success_updates_status_and_writes_one_event`
 - `test_transitions.py::test_wrong_from_status_returns_false_and_writes_no_event`
@@ -695,7 +703,7 @@ Dockerfile, Compose (postgres healthcheck, `dbinit`, `api`, `tests`), `config.py
 
 ### M3: Claim, leases, generation
 
-`claim.py` [Albert writes the claim; reclaim is reviewed with him], `hooks.py`, `llm/`, `policy.py`, `worker.py` draft path, retry limit for generation, `worker` Compose service.
+`claim.py` [core] with the reclaim sweep, `hooks.py`, `llm/`, `policy.py`, `worker.py` draft path, retry limit for generation, `worker` Compose service.
 
 - `test_policy.py::test_accepts_add_column` (parametrized: both tables, every allowed type, with and without `public.`)
 - `test_policy.py::test_rejects` (parametrized: empty, unparseable, two statements, `SELECT`, `DROP TABLE`, `CREATE TABLE`, other table, other schema, `IF EXISTS`, `IF NOT EXISTS`, two commands, `DROP COLUMN`, `DEFAULT`, `NOT NULL`, `REFERENCES`, disallowed type, array type, over-long input)
@@ -719,7 +727,7 @@ Dockerfile, Compose (postgres healthcheck, `dbinit`, `api`, `tests`), `config.py
 
 ### M4: Marker-first execution
 
-Target schema and role, `target.py` [Albert], `worker.py` execute path, reclaim for `EXECUTING`, retry limit for execution.
+Target schema and role, `target.py` [core], `worker.py` execute path, reclaim for `EXECUTING`, retry limit for execution.
 
 - `test_target_role.py::test_migrator_is_not_superuser`
 - `test_target_role.py::test_migrator_can_alter_demo_tables`
@@ -744,7 +752,7 @@ Target schema and role, `target.py` [Albert], `worker.py` execute path, reclaim 
 
 ### M5: Idempotency keys
 
-`idempotency_keys` table, `idempotency.py` [Albert], header required on approve and reject.
+`idempotency_keys` table, `idempotency.py` [core], header required on approve and reject.
 
 - `test_idempotency.py::test_missing_key_422`
 - `test_idempotency.py::test_same_key_same_body_replays_identical_response_one_event`
@@ -755,6 +763,13 @@ Target schema and role, `target.py` [Albert], `worker.py` execute path, reclaim 
 - `test_idempotency.py::test_two_simultaneous_requests_same_key_one_mutation_identical_responses` (A paused at `idempotency.after_reserve`; B seen blocked; A released; B replays)
 - `test_idempotency.py::test_second_request_proceeds_when_first_rolls_back`
 - `test_concurrent_approval.py::test_20_concurrent_approvals_exactly_one_wins` still passes, now with 20 distinct required keys
+
+### Phase 2 backlog (not part of M1–M5; only when Albert says so)
+
+- **Live-HTTP concurrency test:** 20 real approve requests against a running `api` container. Until it exists, the README rule in §10 applies.
+- Retry `lock_timeout` automatically? Revisit D9 with the Phase 2 `lock_timeout` test.
+- PLAN's own Phase 2 list: Groq adapter, CI, structured logs, `demo_crash.py`, GIF.
+- Future work beyond Phase 2: target-side fencing (D23).
 
 ---
 
@@ -769,12 +784,12 @@ Target schema and role, `target.py` [Albert], `worker.py` execute path, reclaim 
 | D5 | No lease renewal | Heartbeat thread extending the lease | A second thread and connection per worker for work bounded at ~40 s. Timeouts are set under the lease instead. |
 | D6 | A worker's write checks only token and status, not `lease_expires_at > now()` | Also require an unexpired lease | Until someone reclaims the row, nobody else can be working on it, so accepting the late write is safe and avoids redoing finished work. |
 | D7 | Retry = abandon the lease | A worker-initiated "release" transition | One recovery path to build, test, and explain. Cost: a transient failure waits up to `LEASE_SECONDS` before retry. |
-| D8 | Retry limit pulled into M3/M4, enforced by the claiming worker; execution at the limit reads the marker before deciding | Defer to Phase 2 (PLAN); or have the reclaim sweep mark `FAILED` | Without it a poison job loops forever through the whole core build. The claimer holds a lease, so the write satisfies invariant 3, and reading the marker avoids marking `FAILED` a migration that actually applied. |
-| D9 | DDL errors, including both timeouts, are terminal `FAILED`; unknown outcomes retry | Retry `lock_timeout` automatically | Deterministic and simple; avoids a retry storm against a locked table. Revisit in Phase 2 alongside the `lock_timeout` test. |
+| D8 | **Accepted 2026-11-16.** Retry limit pulled into M3/M4, enforced by the claiming worker; execution at the limit reads the marker before deciding | Defer to Phase 2 (PLAN); or have the reclaim sweep mark `FAILED` | Without it a poison job loops forever through the whole core build. The claimer holds a lease, so the write satisfies invariant 3, and reading the marker avoids marking `FAILED` a migration that actually applied. |
+| D9 | **Accepted 2026-11-16 for v1.** DDL errors, including both timeouts, are terminal `FAILED`; unknown outcomes retry. A timeout on the marker insert is classified separately as contention and retries (§4.3) | Retry `lock_timeout` automatically | Deterministic and simple; avoids a retry storm against a locked table. Revisit in Phase 2 alongside the `lock_timeout` test. |
 | D10 | Lease times use the database clock; tests backdate `lease_expires_at` | Inject a Python clock; real short leases with sleeps | One clock shared by all workers, no drift. Backdating is instant and deterministic. |
 | D11 | Hash is sha256 of the exact stored text | Normalize whitespace/case, or hash the parse tree | "Approved this exact statement" should mean byte-for-byte. Nothing edits the SQL in v1, so normalization buys nothing. |
 | D12 | Policy allows only nullable, default-less `ADD COLUMN` of listed types; `IF NOT EXISTS` banned | Allow `DEFAULT`/`NOT NULL`; allow `IF NOT EXISTS` | Defaults can call functions and rewrite tables. `IF NOT EXISTS` could record a no-op as applied. |
-| D13 | Many-way concurrency tests call service and worker functions from threads; HTTP mapping is tested single-threaded | 20 real HTTP requests against a running `api` container | The race lives in Postgres, and threads with separate connections exercise it exactly. A live server adds startup and reset coordination without testing more of the guarantee. Cost: the HTTP layer is not itself under concurrent load in tests. |
+| D13 | **Accepted 2026-11-16**, with the README wording rule in §10 and a live-HTTP test logged as Phase 2 work. Many-way concurrency tests call service and worker functions from threads; HTTP mapping is tested single-threaded | 20 real HTTP requests against a running `api` container | The race lives in Postgres, and threads with separate connections exercise it exactly. A live server adds startup and reset coordination without testing more of the guarantee. Cost: the HTTP layer is not itself under concurrent load in tests. |
 | D14 | Crash tests kill a real subprocess with `os._exit`; pause-style tests use in-process hooks | Raise a fake exception in-process for crashes | A real process death proves no cleanup code runs. In-process hooks are simpler where nothing needs to die. |
 | D15 | Relay connects to `relay_db` as the admin role from `.env` | A dedicated least-privilege Relay role | PLAN only requires least privilege on the target. One more role and grant set to maintain for no tested guarantee. |
 | D16 | One connection per API request, no pool | `psycopg_pool` | No extra dependency or pool lifecycle to learn. Connecting costs a few ms locally. Switch when request rate makes that matter. |
@@ -783,4 +798,15 @@ Target schema and role, `target.py` [Albert], `worker.py` execute path, reclaim 
 | D19 | Idempotency saves every normal response, including `404` and `409`; exceptions roll back the key | Save only `2xx` | "Same request, same answer" holds for conflicts too, and the 20-key test stays simple. |
 | D20 | `risk_level` comes from the LLM and gates nothing | Compute risk in code; block on `HIGH` | The policy already decides what may run. Risk is reviewer context only. |
 | D21 | Reject reason and failure text live in `migration_events.detail` (failure text also in `migrations.error`) | A `reject_reason` column | One generic field on the audit row instead of a column per outcome. |
-| D22 | Stack: no deviation from CLAUDE.md | | |
+| D22 | Python 3.12 (`python:3.12-slim`) | Python 3.13, which PLAN gives as an example | CLAUDE.md's approved stack names 3.12, and pglast 8.8 has `cp312` wheels for x86_64 and aarch64 Linux, so neither machine needs a compiler in the image. |
+| D23 | **Future work, not built.** The late-apply gap (§1 #5) stays a documented non-guarantee in v1. The real fix is a fencing check enforced inside target_db: every claim gets a number that only ever increases (a new counter, since `attempts` resets); target_db keeps the highest number seen per migration in a table the migrator can only raise; the target transaction's first statement raises it to its own number and aborts if a higher one is already there. A worker about to mark `FAILED` first raises the fence, so an older attempt that wakes up later is refused by the target itself. | Build it now; rely on the lease token alone; narrow the window with timeouts only (what v1 does) | The lease token is checked by Relay, not by the target, so it cannot stop a stale worker there. Fencing needs a second target table, a new counter, and its own crash tests: too much for the v1 sprint. The README must list late apply as a non-guarantee. |
+
+---
+
+## 10. README rules
+
+The README may claim only what a test demonstrates (invariant 6). Specific wording rules:
+
+- Say **"concurrent approvals"**, never "concurrent requests", until the live-HTTP concurrency test exists (§8 Phase 2 backlog). The current test drives 20 threads through the service layer, not 20 HTTP requests (D13).
+- Never say "exactly-once". Say "at-least-once delivery with once-only effects on the target, for the tested workflow".
+- List as non-guarantees: a migration marked `FAILED` may still be applied later by a stale worker (§1 #5, D23); no atomic commit across the two databases; no safety for SQL the policy allows but is still wrong; `X-User` is not authentication.
