@@ -8,8 +8,8 @@ Status values: `not started`, `in progress`, `done`.
 
 - **Done:** M1 built and its automated checks pass (28 tests); the manual restart gate passed. Earlier: DESIGN.md written, all 25 §1 resolutions accepted, D8, D9, D13 accepted, Python fixed at 3.12.
 - **Done since:** M2 built (94 tests at that point). M3 built; the full suite passes (214 tests). Both wait for Albert's review and commit.
-- **Done since:** M4 built, plan approved by Albert first; the full suite passes (268 tests). Waits for Albert's review and commit.
-- **Before the next `docker compose` command:** add `TARGET_MIGRATOR_PASSWORD=<letters and digits>` to `.env`. Compose now refuses to start without it. During the M4 session the value was passed from the shell as `localtestonly1`, so the `relay_migrator` role and the running containers currently use that; the next `docker compose up -d` with your `.env` value resets the role's password and recreates the containers.
+- **Done since:** M4 built, plan approved by Albert first; the full suite passes (270 tests). Waits for Albert's review and commit.
+- **Run `docker compose up -d` once:** `TARGET_MIGRATOR_PASSWORD` is now in `.env`, and the last test runs set the `relay_migrator` role to that value. The api and worker containers were created earlier with a shell-supplied password (`localtestonly1`), so until they are recreated the running workers cannot log in to `target_db` (an approved job would be abandoned and retried, not failed).
 - **Next:** M5 (idempotency keys). It touches transactions, so it needs a plan and Albert's OK first.
 - **Answered (Albert, 2026-11-16):**
   - Keep D16: one connection per request, no `psycopg_pool`.
@@ -23,8 +23,7 @@ Status values: `not started`, `in progress`, `done`.
   1. CLAUDE.md says "short leases or an injectable clock"; the accepted §1 #20 has tests backdate `lease_expires_at` instead. Confirm backdating is fine, or CLAUDE.md should be reworded.
   2. PLAN.md line 60 still says "e.g. `python:3.13-slim`". Not edited; update when PLAN is next touched.
   3. This session read DESIGN §8 as the M1 scope (14 listed tests), which is wider than the five tests in the prompt, and left `target_schema.sql` and the role to M4. Say so if you wanted them in M1.
-  4. M4: the lease re-check requires only "not yet expired". It could require "enough lease left for the whole target transaction" (remaining time > lock + statement timeouts). Not built; say so if you want it.
-  5. M4: the 10-second lease margin is a constant in `relay/config.py`, not a setting (D33). Confirm that is what you want.
+  (M4's two questions are answered: the lease re-check now requires remaining lease > lock + statement timeouts + margin, and the margin stays a constant. Both are in D33.)
 - **Untested:** see M1 to M4 below. M5 has no code. The pglast wheel check was read from PyPI, not an image build (pglast is not installed until M3).
 
 ## M1: Scaffolding
@@ -125,7 +124,7 @@ Status values: `not started`, `in progress`, `done`.
 - Scope: target schema and `relay_migrator` role, marker transaction (core operation), worker execute path, claim widened to `APPROVED`, reclaim for `EXECUTING`, execution retry limit (D8), lease startup check and lease re-check (D33), `scripts/demo_crash.py` (D36)
 - Exit checks:
   - [x] `test_target_role.py` (5 guarantees, 6 tests)
-  - [x] `test_execute.py` (DESIGN's 7, plus 5 added: no Relay transaction during target work, expired lease before target work, owner finishes after expiry, timeouts scoped to the transaction, `DDLFailed` leaves the connection usable)
+  - [x] `test_execute.py` (DESIGN's 7, plus 7 added: no Relay transaction during target work, expired lease before target work, too little lease left, just enough lease left, owner finishes after expiry, timeouts scoped to the transaction, `DDLFailed` leaves the connection usable)
   - [x] `test_marker_contention.py` (first commits; first rolls back)
   - [x] `test_reclaim.py::test_expired_executing_returns_to_approved`
   - [x] `test_stale_worker.py::test_stale_executor_write_matches_zero_rows`
@@ -144,6 +143,7 @@ Status values: `not started`, `in progress`, `done`.
     4. `DDLFailed` raised without confirming the rollback -> 1 failed (`test_lost_target_connection_does_not_mark_failed`: the killed session's error does carry a SQLSTATE, so the connection check is what keeps it "unknown").
     5. `dbinit` re-runs the target schema every time -> 1 failed (`test_dbinit_does_not_rebuild_a_target_that_already_has_its_schema`).
     6. Lease check skipped at worker startup -> 1 failed (`test_worker_refuses_to_start_with_a_lease_that_is_too_short`).
+  - Follow-up (remaining-lease rule, D33): with the re-check reduced to "not yet expired", `pytest tests/test_execute.py -q` -> 1 failed (`test_lease_with_too_little_time_left_stops_before_target_work`), 13 passed; rule restored. Then `docker compose run --rm tests pytest -q` -> `270 passed, 1 warning`, and the repeat loop -> `73 passed` 20 times out of 20. These runs used the password from `.env`. The demo and the live check were NOT re-run after this change.
   - Demo: `docker compose run --rm tests python -m scripts.demo_crash` -> exit 0; frozen state `EXECUTING` with 1 marker and the column; final state `SUCCEEDED`, 1 marker, 8 audit events.
   - Live check: `docker compose up -d --build`, then over HTTP: create `add column m4_live_check text to orders`, approve, -> `SUCCEEDED`; `target_db` has the marker and `orders.m4_live_check`. `dbinit` upgraded the existing volume in place (role, REVOKE, target schema) without `--reset`. That row, column, and marker are still in the dev databases. (My first try of this check posted before the API was up and failed; the script was fixed to wait for `/health`.)
 - Not yet tested:

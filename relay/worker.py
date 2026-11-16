@@ -25,7 +25,13 @@ import psycopg
 
 from relay import db, hooks, policy
 from relay.claim import Claim, claim_one, reclaim_expired
-from relay.config import SCHEMA_SUMMARY, Settings, check_lease_outlasts_target_work, load_settings
+from relay.config import (
+    SCHEMA_SUMMARY,
+    Settings,
+    check_lease_outlasts_target_work,
+    load_settings,
+    target_work_budget_seconds,
+)
 from relay.llm import RISK_LEVELS, LLMClient, LLMPermanentError, LLMTransientError, get_llm
 from relay.sqlhash import sha256_hex
 from relay.target import HASH_MISMATCH, DDLFailed, apply_on_target, read_marker_hash
@@ -125,7 +131,7 @@ class Worker:
 
             checks   (no transaction)   stored SQL still has the approved hash; policy again
             connect  (no transaction)   open the target connection as relay_migrator
-            re-check (one Relay read)   the job is still mine and my lease has not run out
+            re-check (one Relay read)   the job is still mine, with enough lease left for T1
             T1       (target txn)       marker first, then the DDL, COMMIT  -> relay/target.py
             R4       (Relay txn)        EXECUTING -> SUCCEEDED or FAILED, guarded by my token
 
@@ -150,10 +156,12 @@ class Worker:
             log.warning("job %s: cannot reach the target, abandoning the lease: %s", claim.id, error)
             return ABANDONED
         try:
-            # Last look before touching the target. If my lease has run out, another worker
-            # may take this job at any moment, so starting now would make me the stale
-            # worker (DESIGN.md section 1 #5). Stop without writing anything.
-            if not self._lease_is_live(claim):
+            # Last look before touching the target. If my lease does not have enough time
+            # left to cover the whole target transaction, another worker could take this job
+            # while I am still inside it, which would make me the stale worker (DESIGN.md
+            # section 1 #5). Stop without writing anything; the lease expires and the job
+            # is retried with a fresh one.
+            if not self._lease_covers_target_work(claim):
                 return self._lost(claim)
             try:
                 result = apply_on_target(                                             # T1: target txn
@@ -179,19 +187,26 @@ class Worker:
         # APPLIED (I ran the DDL) or ALREADY_APPLIED (an earlier attempt did): both are success.
         return self._succeed(claim)
 
-    def _lease_is_live(self, claim: Claim) -> bool:
-        """One plain read, no lock: is this EXECUTING job still mine, with time left on the lease?
+    def _lease_covers_target_work(self, claim: Claim) -> bool:
+        """One plain read, no lock: is this EXECUTING job still mine, with MORE lease time
+        left than the target transaction is allowed to take?
+
+        The time left is measured on the database clock (`now()`), like every other lease
+        comparison, and compared with lock_timeout + statement_timeout + the safety margin
+        (decision D33). So a worker that was slow to get here does not start work it might
+        not finish inside its lease.
 
         This is stricter than the token check on a write. A write is accepted after expiry
         as long as nobody has reclaimed the row (decision D6), because finishing is harmless.
-        STARTING target work on an expired lease is not: it invites a second worker in.
+        STARTING target work without enough lease left is not: it invites a second worker in.
         """
         row = self.conn.execute(
             """
             SELECT 1 AS mine FROM migrations
-            WHERE id = %s AND status = 'EXECUTING' AND lease_token = %s AND lease_expires_at > now()
+            WHERE id = %(id)s AND status = 'EXECUTING' AND lease_token = %(token)s
+              AND lease_expires_at > now() + make_interval(secs => %(budget)s)
             """,
-            (claim.id, claim.lease_token),
+            {"id": claim.id, "token": claim.lease_token, "budget": target_work_budget_seconds(self.settings)},
         ).fetchone()
         return row is not None
 

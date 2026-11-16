@@ -14,7 +14,15 @@ import pytest
 
 from relay import hooks, target as target_ops, worker
 from relay.sqlhash import sha256_hex
-from tests.helpers import columns_of, events_of, expire_lease, insert_marker, markers_of, seed_migration
+from tests.helpers import (
+    columns_of,
+    events_of,
+    expire_lease,
+    insert_marker,
+    markers_of,
+    seed_migration,
+    set_lease_remaining,
+)
 
 ADD_NICKNAME = "ALTER TABLE public.customers ADD COLUMN nickname text"
 ORIGINAL_CUSTOMER_COLUMNS = {"id", "email", "full_name", "created_at"}
@@ -242,6 +250,57 @@ def test_expired_lease_before_target_work_leaves_target_untouched(conn, target, 
 
     assert w1.run_once() == worker.SUCCEEDED     # reclaim, claim again, apply
     assert row_of(conn, migration_id)["attempts"] == 2
+
+
+def test_lease_with_too_little_time_left_stops_before_target_work(conn, target, make_worker):
+    """Guarantee: a worker whose lease is still live, but has less time left than the target
+    transaction is allowed to take, does not start: the pass ends as `lost`, the target is
+    untouched, and nothing is written to Relay. The job is recovered the normal way.
+
+    Invariant: narrows the late-apply gap (decisions D23, D33). With the defaults the target
+    work may take up to 5 s (lock) + 15 s (statement) + 10 s (margin) = 30 s. A lease with
+    20 s left could expire while the DDL is still running, letting a second worker in. The
+    remaining time is set at an exact point on the database clock (a hook right after the
+    claim commits), not by waiting.
+    """
+    migration_id = seed_migration(conn, status="APPROVED", sql=ADD_NICKNAME)
+    shorten_once = []
+
+    def leave_20_seconds_on_the_first_claim():
+        if not shorten_once:
+            shorten_once.append(True)
+            set_lease_remaining(conn, migration_id, 20)
+
+    hooks.register("claim.after_commit", leave_20_seconds_on_the_first_claim)
+    w1 = make_worker("w1")
+
+    outcome = w1.run_once()
+
+    assert outcome == worker.LOST
+    row = row_of(conn, migration_id)
+    assert (row["status"], row["error"], row["lease_token"] is not None) == ("EXECUTING", None, True)
+    assert markers_of(target) == {}
+    assert "nickname" not in columns_of(target, "customers")
+
+    assert w1.run_once() == worker.IDLE          # the 20 s lease is still live: not reclaimable yet
+    expire_lease(conn, migration_id)
+    assert w1.run_once() == worker.SUCCEEDED     # reclaimed, claimed with a full lease, applied
+
+
+def test_lease_with_just_enough_time_left_proceeds(conn, target, make_worker):
+    """Guarantee: the rule is "more than the budget", nothing stricter: with 35 s left against
+    a 30 s budget the worker goes ahead and the migration succeeds.
+
+    Invariant: none of the six; pins the other side of the D33 boundary so the check cannot
+    quietly become "always stop".
+    """
+    migration_id = seed_migration(conn, status="APPROVED", sql=ADD_NICKNAME)
+    hooks.register("claim.after_commit", lambda: set_lease_remaining(conn, migration_id, 35))
+
+    outcome = make_worker("w1").run_once()
+
+    assert outcome == worker.SUCCEEDED
+    assert markers_of(target) == {migration_id: sha256_hex(ADD_NICKNAME)}
 
 
 def test_owner_can_mark_succeeded_after_expiry_if_not_yet_reclaimed(conn, target, make_worker):

@@ -154,6 +154,17 @@ def expire_lease(conn, migration_id) -> None:
     )
 
 
+def set_lease_remaining(conn, migration_id, seconds: float) -> None:
+    """Make a lease expire `seconds` from now on the database clock, without waiting.
+
+    Like expire_lease, this touches only `lease_expires_at`, never `status`.
+    """
+    conn.execute(
+        "UPDATE migrations SET lease_expires_at = now() + make_interval(secs => %s) WHERE id = %s",
+        (seconds, migration_id),
+    )
+
+
 class FixedLLM:
     """A test LLM that always proposes the same SQL. Lets a test tell two workers' results apart."""
 

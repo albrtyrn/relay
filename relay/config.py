@@ -67,26 +67,38 @@ def timeout_seconds(text: str) -> float:
     return int(match.group(1)) * _SECONDS_PER_UNIT[match.group(2)]
 
 
-def check_lease_outlasts_target_work(settings: Settings) -> None:
-    """Refuse settings under which a healthy worker's lease could expire mid-execution.
+def target_work_budget_seconds(settings: Settings) -> float:
+    """The time one execution may need on the target: lock_timeout + statement_timeout + margin.
 
-    The rule (decision D33): LEASE_SECONDS > lock_timeout + statement_timeout + margin.
     Why that sum: in the target transaction the marker insert can wait up to lock_timeout
     for another worker's marker, and the DDL can run up to statement_timeout. Everything
     else is covered by the margin.
 
-    A timeout of zero is refused too: in Postgres, 0 means "no timeout", so the target
-    transaction would have no upper bound at all.
+    Used twice (decision D33): at startup, where the whole lease must be longer than this,
+    and just before the target transaction, where the lease time still REMAINING must be.
 
-    This narrows the late-apply gap (DESIGN.md section 1 #5); it does not close it. A worker
-    frozen by the operating system can still overrun any lease.
+    A timeout of zero is refused: in Postgres, 0 means "no timeout", so the target
+    transaction would have no upper bound at all.
     """
     lock = timeout_seconds(settings.lock_timeout)
     statement = timeout_seconds(settings.statement_timeout)
     for name, value in (("LOCK_TIMEOUT", lock), ("STATEMENT_TIMEOUT", statement)):
         if value <= 0:
             raise ValueError(f"{name} must be greater than zero; 0 disables the timeout in Postgres")
-    needed = lock + statement + LEASE_SAFETY_MARGIN_SECONDS
+    return lock + statement + LEASE_SAFETY_MARGIN_SECONDS
+
+
+def check_lease_outlasts_target_work(settings: Settings) -> None:
+    """Refuse settings under which a healthy worker's lease could expire mid-execution.
+
+    The rule (decision D33): LEASE_SECONDS > lock_timeout + statement_timeout + margin.
+
+    This narrows the late-apply gap (DESIGN.md section 1 #5); it does not close it. A worker
+    frozen by the operating system can still overrun any lease.
+    """
+    lock = timeout_seconds(settings.lock_timeout)
+    statement = timeout_seconds(settings.statement_timeout)
+    needed = target_work_budget_seconds(settings)
     if not settings.lease_seconds > needed:
         raise ValueError(
             f"LEASE_SECONDS ({settings.lease_seconds}) must be greater than LOCK_TIMEOUT ({lock:g}s) "
