@@ -1,6 +1,12 @@
 """A stale worker: one whose job was taken over while it was still working (DESIGN.md section 8).
 
-Two drafting cases (M3) and the executing case (M4).
+Two drafting cases (M3) and two executing cases (M4; the mid-flight one was added after the
+review, REVIEW.md section 4).
+
+Each phase has a pair, and the pair matters. In the "finished" test the new owner has
+already completed the job, so the STATUS has moved on and that alone refuses the stale
+write. In the "mid-draft" / "mid-flight" test the new owner has claimed but not finished:
+the status is the same for both workers, and only the lease token tells them apart.
 """
 
 import threading
@@ -166,3 +172,51 @@ def test_stale_drafter_cannot_overwrite_a_new_owner_mid_draft(conn, make_worker)
         "SELECT status, lease_token, proposed_sql FROM migrations WHERE id = %s", (migration_id,)
     ).fetchone()
     assert row == {"status": "DRAFTING", "lease_token": claim_b.lease_token, "proposed_sql": None}
+
+
+def test_stale_executor_cannot_overwrite_a_new_owner_mid_flight(conn, target, make_worker):
+    """Guarantee: worker A commits on the target and is then overtaken by B, which has
+    reclaimed and re-claimed the job but NOT finished it. A's write of SUCCEEDED matches
+    0 rows: the row stays EXECUTING under B's token and the audit log holds no success.
+
+    Invariant: 3, and specifically the lease_token half of it, on the execute path. Here the
+    status is EXECUTING for both workers, so the status check alone would let A through;
+    only the token tells the old owner from the new one. (A's success would even be "true",
+    since the target did commit. It is still refused: B owns the job now, and B's marker
+    insert will find A's marker and record the success with a valid token.)
+    How the race is forced: A is paused by a hook at `execute.after_target_commit`, between
+    its target commit and its Relay write, while the test expires its lease and makes B's
+    claim. No sleeps.
+    """
+    sql = "ALTER TABLE public.customers ADD COLUMN nickname text"
+    migration_id = seed_migration(conn, status="APPROVED", sql=sql)
+    worker_a = make_worker("a")
+    a_is_paused = threading.Event()
+    a_may_continue = threading.Event()
+
+    def pause():
+        a_is_paused.set()
+        assert a_may_continue.wait(THREAD_TIMEOUT), "test never released worker A"
+
+    hooks.register("execute.after_target_commit", pause)
+
+    thread_a = Background(worker_a.run_once)
+    try:
+        assert a_is_paused.wait(THREAD_TIMEOUT), "worker A never reached execute.after_target_commit"
+        expire_lease(conn, migration_id)
+        assert reclaim_expired(conn, "b") == 1
+        claim_b = claim_one(conn, "b", lease_seconds=60)   # B owns the job and is "still executing"
+    finally:
+        a_may_continue.set()
+    outcome_a = thread_a.join()
+
+    assert outcome_a == worker.LOST
+    assert markers_of(target) == {migration_id: sha256_hex(sql)}   # A's target commit is real
+    row = conn.execute("SELECT status, lease_token FROM migrations WHERE id = %s", (migration_id,)).fetchone()
+    assert row == {"status": "EXECUTING", "lease_token": claim_b.lease_token}
+    assert events_of(conn, migration_id) == [
+        ("APPROVED", "EXECUTING", "worker:a"),
+        ("EXECUTING", "APPROVED", "reclaimer:b"),
+        ("APPROVED", "EXECUTING", "worker:b"),
+        # and no SUCCEEDED from worker:a
+    ]

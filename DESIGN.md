@@ -57,6 +57,7 @@ relay/
 ├── DESIGN.md               this file
 ├── PROGRESS.md             milestone status, one entry per milestone
 ├── README.md               setup and (later) tested guarantees only
+├── REVIEW.md               skeptical review of M1-M4 (2026-11-16): findings F1-F10, mutation results, untested guarantees
 ├── LICENSE
 ├── .env.example            fake values for every variable in §7.6
 ├── .gitattributes          forces LF line endings
@@ -88,12 +89,18 @@ relay/
 │       ├── __init__.py     Proposal, the two error types, LLMClient protocol, get_llm()
 │       └── fake.py         deterministic fake (groq.py arrives in Phase 2)
 ├── scripts/
-│   └── demo_crash.py       M4 (D36); uses the same hook as the crash test, on its own demo databases
+│   ├── demo_crash.py       M4 (D36); uses the same hook as the crash test, on its own demo databases
+│   └── break_guards.py     mutation check: removes one guard at a time in a temporary checkout and reports which tests fail; run on the host
+├── probes/                 what is left of the review's experiments (REVIEW.md §8); not collected by default (`pytest.ini` has `testpaths = tests`)
+│   ├── conftest.py         re-exports the fixtures of tests/conftest.py
+│   └── test_review_probes.py   `finding_` probes assert a bad outcome on purpose; `measure_` probes only print; the rest became tests (§8)
 └── tests/
     ├── conftest.py         database creation, per-test reset, shared fixtures
     ├── helpers.py          seed rows, expire_lease, run threads behind a Barrier, spawn a worker process
     └── test_*.py           one file per behavior, listed in §8
 ```
+
+Run the probes on request with `docker compose run --rm tests python -m pytest probes -s` (`python -m` puts the repo root on the import path, which the probes need to import `tests.conftest`; plain `pytest probes` fails with `No module named 'tests'`). A probe that becomes a real test moves to `tests/` and is deleted from `probes/`.
 
 Schema files grow with the milestones (M1: `migrations`, `migration_events`; M4: target; M5: `idempotency_keys`). Data is disposable, so a schema change means `dbinit --reset`, not a migration tool.
 
@@ -643,10 +650,12 @@ To verify at M3 before writing the rules: print the parse tree for each allowed 
 
 ### 7.3 Forcing races
 
-Two tools, no sleeps:
+Four tools, no sleeps:
 
 - **Start together:** N threads, each with its own connection, wait on a `threading.Barrier(N)` and then act. Used for the 20-approval test and the 4-worker contention tests. Threads are real concurrency here: Python releases its global lock while waiting on the network, and Postgres sees N independent sessions.
 - **Stop at an exact point:** a hook (§7.5) makes thread A wait on a `threading.Event` at a named line, e.g. holding its transaction open. The test then runs B against that known state and releases A. Used for "two transactions, one row", the stale worker, marker contention, and the same-key idempotency race.
+- **Cut a connection at an exact protocol message:** `CommitCuttingProxy` in `tests/test_commit_cut.py`, a small TCP relay (standard-library sockets) placed between the worker and the target. It copies bytes both ways until it sees the `COMMIT` message, then closes the connection either after the server has processed it (answer lost) or before forwarding it (never arrived). The test asserts the cut happened, so a proxy that missed the message fails the test (D38).
+- **A held lock, for timeouts:** the test takes a table lock or inserts an uncommitted marker in a transaction it keeps open, and runs the worker with a 300 ms timeout in a `Background` thread. The wait for the timeout is real time, but it is the thing under test, not a sleep that creates a race; the thread's join timeout turns "the timeout never fired" into a failure instead of a hang.
 - To prove B is really blocked (not just slow), the test polls `pg_stat_activity` for B's session with `wait_event_type = 'Lock'`, with a deadline.
 - Every `Barrier.wait`, `Event.wait`, and `Thread.join` has a timeout and the test fails if it expires. No hung test runs.
 
@@ -818,6 +827,24 @@ Target schema and role, `target.py` [core], `worker.py` execute path, reclaim fo
   - `test_dbinit_target.py` (D34: no rebuild of an existing target; forced rebuild restores it)
 - `scripts/demo_crash.py` (D36), run by hand.
 
+### Review follow-up 1: tests for behavior M3 and M4 already had (2026-11-16)
+
+No production code changed. These came from the review's probes (REVIEW.md §5 and §7, items 5 to 9 and 13) and passed on first run; what shows they can fail is the mutation check (`scripts/break_guards.py`), noted per test.
+
+- `test_reclaim_races.py::test_second_reclaimer_skips_a_row_the_first_is_reclaiming` (forced; fails without the sweep's `SKIP LOCKED`)
+- `test_reclaim_races.py::test_eight_reclaimers_40_expired_rows_each_reclaimed_exactly_once` (start-together)
+- `test_reclaim_races.py::test_reclaimer_skips_a_row_whose_owner_is_saving` (forced; fails without the sweep's `SKIP LOCKED`)
+- `test_reclaim_races.py::test_owner_save_waits_for_an_open_reclaim_then_loses_when_it_commits` (forced, through the real worker; A is seen blocked)
+- `test_reclaim_races.py::test_owner_save_proceeds_when_the_open_reclaim_rolls_back` (forced)
+- `test_reclaim_races.py::test_owner_saves_and_three_reclaimers_on_30_rows_one_outcome_per_row` (start-together)
+- `test_commit_cut.py::test_commit_processed_but_answer_lost_is_not_failed_and_next_worker_finds_the_marker` (§1 #8; proxy, D38)
+- `test_commit_cut.py::test_commit_that_never_arrived_is_not_failed_and_next_worker_applies_it`
+- `test_timeouts_fire.py::test_lock_timeout_during_ddl_marks_failed_and_leaves_target_clean` (D9; `55P03`)
+- `test_timeouts_fire.py::test_statement_timeout_during_ddl_marks_failed_and_leaves_target_clean` (D9; `57014`)
+- `test_timeouts_fire.py::test_lock_timeout_on_the_marker_step_abandons_and_the_retry_succeeds` (§1 #6)
+- `test_timeouts_fire.py::test_idle_in_transaction_timeout_ends_a_stalled_target_transaction` (fails without `_rolled_back_cleanly`)
+- `test_stale_worker.py::test_stale_executor_cannot_overwrite_a_new_owner_mid_flight` (the executing twin of the mid-draft test; fails without the helper's `lease_token` condition)
+
 ### M5: Idempotency keys
 
 `idempotency_keys` table, `idempotency.py` [core], header required on approve and reject.
@@ -883,6 +910,7 @@ Target schema and role, `target.py` [core], `worker.py` execute path, reclaim fo
 | D35 | **Accepted 2026-11-16 (M4).** `REVOKE CONNECT ON DATABASE <relay db> FROM PUBLIC` is run by `dbinit`, with the real database name, on every run | Keep the line in `relay_schema.sql` as §3.1 first showed | The statement names the database, and tests use `relay_test`. The schema file is also skipped when the tables exist (D24), so an existing dev volume would never have received the line. |
 | D36 | **Accepted 2026-11-16 (M4).** `scripts/demo_crash.py` is built in M4, not Phase 2. It kills a worker *subprocess* with SIGKILL, runs on its own `relay_demo` / `target_demo` databases, and waits out a real 15-second lease (with `LOCK_TIMEOUT=1s`, `STATEMENT_TIMEOUT=2s` to satisfy D33) | Phase 2 (PLAN); kill a Compose container; run on the dev databases; backdate the lease as tests do | Albert asked for it with M4. A subprocess needs no Docker socket inside the container and dies the same way. On the dev databases the two Compose workers would race the demo for its job. A demo should show the real wait; tests are where time is faked. |
 | D37 | **Added at M4.** `run_once()` gains the outcome `succeeded`, and `lost` also covers "my lease had too little time left to begin target work" (extends D31) | Reuse `saved` for a finished execution; a separate `expired` outcome | Tests and the demo need to tell a draft saved from a migration applied. In both `lost` cases the worker does the same thing: stop and write nothing. |
+| D38 | **Accepted 2026-11-16 (review follow-up 1).** A connection lost during the target `COMMIT` is tested with a TCP relay written in the test file with standard-library sockets (`CommitCuttingProxy`), which cuts the connection when it sees the `COMMIT` message, in two modes: after the server processed it, or before it arrived | `pg_terminate_backend` from a hook (what `test_lost_target_connection_does_not_mark_failed` uses); an external fault-injection proxy such as Toxiproxy; a fake connection object | Killing the session cannot be aimed at the instant between "`COMMIT` sent" and "answer received", and that instant is the only place where the outcome is truly unknown. An external proxy is a new dependency and a new Compose service for about 60 lines of sockets. A fake connection would break invariant 5: the point is what real Postgres does with a half-finished commit. Cost: the proxy finds `COMMIT` by its bytes in one network read, which relies on how psycopg ends a transaction block; each test asserts the cut happened, so a change there fails loudly. |
 
 ---
 

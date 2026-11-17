@@ -10,7 +10,20 @@ Status values: `not started`, `in progress`, `done`.
 - **Done since:** M2 built (94 tests at that point). M3 built; the full suite passes (214 tests). Both wait for Albert's review and commit.
 - **Done since:** M4 built, plan approved by Albert first; the full suite passes (270 tests). Waits for Albert's review and commit.
 - **Run `docker compose up -d` once:** `TARGET_MIGRATOR_PASSWORD` is now in `.env`, and the last test runs set the `relay_migrator` role to that value. The api and worker containers were created earlier with a shell-supplied password (`localtestonly1`), so until they are recreated the running workers cannot log in to `target_db` (an approved job would be abandoned and retried, not failed).
-- **Next:** M5 (idempotency keys). It touches transactions, so it needs a plan and Albert's OK first.
+- **Done since:** skeptical review of M1 to M4 (REVIEW.md, findings F1 to F10) and `scripts/break_guards.py` (mutation check). Nothing in `relay/` changed. The review's 27 probes are in `probes/` (not collected by default).
+- **Done since:** review follow-up 1 (plan approved by Albert first): 13 probes became tests; no file in `relay/` changed; the full suite passes (283 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit.
+- **Next:** the remaining review follow-ups, in this order, one plan at a time, each waiting for Albert's OK:
+  2. F1: the retry-limit check waits (marker `INSERT` inside a target transaction, then roll back) instead of a plain `SELECT`. The F1 probe becomes a test that fails before the fix.
+  3. F3: `lock_timeout` and `idle_in_transaction_session_timeout` on `relay_db` connections, including how the API answers a lock timeout and what the worker does with one.
+  4. F4(b): target connection failures do not count toward `MAX_ATTEMPTS`. D9 stays as it is.
+  Then M5 (idempotency keys), which also needs a plan and Albert's OK first.
+- **Opus backlog (review findings left for later; see REVIEW.md):**
+  - F5: no network-level timeout on the target connection (a silently dead network can hang a worker).
+  - F6: `test_lost_target_connection_does_not_mark_failed` kills every `relay_migrator` session on the server; crash tests can leak a worker process.
+  - F7: the policy accepts a column name ending in a newline (`$` instead of `\Z` / `fullmatch`).
+  - F8: no test enforces "only the helper writes `status`".
+  - F9: the README's lost-connection sentence was ahead of its test. Follow-up 1 added the test (`test_commit_cut.py`) and the README now cites it; nothing left unless the wording should change.
+  - F10: `GET /migrations/{id}` reads the row and its events in two statements.
 - **Answered (Albert, 2026-11-16):**
   - Keep D16: one connection per request, no `psycopg_pool`.
   - No `pytest-repeat`. Repeat race tests with a shell loop (DESIGN §7.1 and §7.7 updated).
@@ -24,7 +37,7 @@ Status values: `not started`, `in progress`, `done`.
   2. PLAN.md line 60 still says "e.g. `python:3.13-slim`". Not edited; update when PLAN is next touched.
   3. This session read DESIGN §8 as the M1 scope (14 listed tests), which is wider than the five tests in the prompt, and left `target_schema.sql` and the role to M4. Say so if you wanted them in M1.
   (M4's two questions are answered: the lease re-check now requires remaining lease > lock + statement timeouts + margin, and the margin stays a constant. Both are in D33.)
-- **Untested:** see M1 to M4 below. M5 has no code. The pglast wheel check was read from PyPI, not an image build (pglast is not installed until M3).
+- **Untested:** see M1 to M4 and "Review follow-ups" below. M5 has no code. The pglast wheel check was read from PyPI, not an image build (pglast is not installed until M3).
 
 ## M1: Scaffolding
 
@@ -104,9 +117,7 @@ Status values: `not started`, `in progress`, `done`.
   - Live check: `docker compose up -d --build`, then two `POST /migrations`. The allowed one reached `WAITING_FOR_APPROVAL` with a claim event and a save event from one worker; `add column x text to secrets` reached `FAILED` with `policy: table 'secrets' is not an allowed table`. Those two rows are still in the dev `relay_db`.
 - Not yet tested:
   - `run_forever`: the polling loop, jitter, SIGTERM shutdown, reconnect after a lost Relay connection, and the catch-all for unexpected exceptions. Only `run_once` is tested; the live check exercised the loop's happy path once.
-  - `RELAY_HOOK=<name>:pause` (for the Phase 2 demo). Only `:crash` is tested.
-  - Two reclaimers racing for the same expired row, and a reclaimer racing the slow owner's save at the same instant. Both rely on the row lock and `SKIP LOCKED`; only the one-after-the-other versions are tested.
-  - More than `batch_size` (10) expired leases in one sweep.
+  - (Now tested, review follow-up 1: two reclaimers on one row, a reclaimer against the owner's save, and more than `batch_size` expired leases, in `test_reclaim_races.py`. `RELAY_HOOK=<name>:pause` has been tested since M4.)
   - The 50-job test ran 4 workers as threads in one process, not 4 processes. Only the crash test uses a real worker process.
   - Reading `WORKER_ID`, `LEASE_SECONDS`, `POLL_SECONDS`, `MAX_ATTEMPTS`, `LLM_PROVIDER` from the environment (`load_settings`); tests build `Settings` directly.
   - x64 image build with pglast (ARM64 only, as in M1).
@@ -148,9 +159,7 @@ Status values: `not started`, `in progress`, `done`.
   - Live check: `docker compose up -d --build`, then over HTTP: create `add column m4_live_check text to orders`, approve, -> `SUCCEEDED`; `target_db` has the marker and `orders.m4_live_check`. `dbinit` upgraded the existing volume in place (role, REVOKE, target schema) without `--reset`. That row, column, and marker are still in the dev databases. (My first try of this check posted before the API was up and failed; the script was fixed to wait for `/health`.)
 - Not yet tested:
   - The late-apply gap itself (a worker frozen after the lease re-check that commits on the target after the job was marked `FAILED`). It is a documented non-guarantee (D23), not a tested behavior.
-  - `lock_timeout` or `statement_timeout` actually firing: on the marker step (expected: abandon) and on the DDL step (expected: `FAILED`). Only the classification rule is tested, with a duplicate-column error and a killed session. This is the Phase 2 `lock_timeout` test (D9).
-  - `idle_in_transaction_session_timeout` actually ending a stalled target transaction. Only that the setting is in force is tested.
-  - A connection lost during the target `COMMIT` itself (outcome unknown). The lost-connection test kills the session before the DDL.
+  - (Now tested, review follow-up 1: `lock_timeout` and `statement_timeout` firing on the DDL, `lock_timeout` on the marker step, the idle timeout ending a stalled transaction, in `test_timeouts_fire.py`; a connection lost during the target `COMMIT`, both directions, in `test_commit_cut.py`.)
   - Target unreachable at connect time, and target unreachable while reading the marker at the retry limit (both expected: `abandoned`).
   - A marker conflict where the marker then cannot be read (an administrator deleted it mid-transaction).
   - Two workers colliding through the full worker path at the marker step; the contention tests call `apply_on_target` directly on two connections.
@@ -167,6 +176,38 @@ Status values: `not started`, `in progress`, `done`.
   - Decisions D33-D37 added to DESIGN.md; D23 now points at D33. §3, §4.2, §4.3, §5, §7 and §8 updated to match the code.
   - The demo leaves `relay_demo` and `target_demo` behind; each run rebuilds them.
   - README updated to M4, with the non-guarantees section DESIGN §10 requires.
+
+## Review follow-ups (from REVIEW.md)
+
+### 1. Probes to tests
+
+- Status: in progress (all checks pass; waiting on Albert's review)
+- Started: 2026-11-16 / Finished:
+- Scope: 13 review probes rewritten as tests with docstrings. No file in `relay/` changed.
+- Added:
+  - [x] `tests/test_reclaim_races.py` (6: two reclaimers; reclaimer against the owner's save in three forced variants; two start-together tests)
+  - [x] `tests/test_commit_cut.py` (2: `COMMIT` processed but answer lost; `COMMIT` never arrived), with `CommitCuttingProxy` (D38)
+  - [x] `tests/test_timeouts_fire.py` (4: `lock_timeout` on the DDL, `statement_timeout` on the DDL, `lock_timeout` on the marker step, idle timeout)
+  - [x] `tests/test_stale_worker.py::test_stale_executor_cannot_overwrite_a_new_owner_mid_flight`
+  - [x] `tests/helpers.py::wait_until_migrator_sessions_are_gone` (counts sessions in the test's own target database only)
+  - [x] `scripts/break_guards.py`: new tests added to the `expected` lists of `skip-locked-reclaim` (had none), `rollback-confirmed`, `lease-token-check`. No guard pattern changed.
+  - [x] `probes/test_review_probes.py` now holds only the `finding_`, `contrast_`, and `measure_` probes (14 collected, counting the 8 policy cases).
+- Last test run (PowerShell):
+  - Before converting: `docker compose run --rm tests python -m pytest probes -q -p no:cacheprovider -k "p1 or p2 or p3 or p4"` -> `12 passed, 15 deselected`.
+  - `docker compose run --rm tests pytest tests/test_reclaim_races.py tests/test_commit_cut.py tests/test_timeouts_fire.py tests/test_stale_worker.py -q -p no:cacheprovider` -> `16 passed, 1 warning` (13 new, 3 existing).
+  - `python scripts/break_guards.py --only skip-locked-reclaim rollback-confirmed lease-token-check --repeat 3` (host) -> baseline 7 passed; all three `CAUGHT` in 3 runs of 3. `lease-token-check`: 3 expected tests failed (the new mid-flight test among them). `skip-locked-reclaim`: 2 failed (both new). `rollback-confirmed`: 2 failed (the new idle-timeout test among them).
+  - Repeat loop (same shape as M2 to M4) over the four files above -> `16 passed` 20 times out of 20.
+  - `docker compose run --rm tests pytest -q -p no:cacheprovider` -> `283 passed, 1 warning`.
+  - `docker compose run --rm tests python -m pytest probes -q -p no:cacheprovider` -> `14 passed, 1 warning`.
+- Not yet tested:
+  - No mutation shows that the two `COMMIT`-cut tests, the two DDL-timeout tests, or the marker-step timeout test can fail: there is no one-line guard to remove for them (they depend on the worker treating every non-`DDLFailed` target error as unknown, and on the timeouts being set at all). The `--full` mutation run over every guard was not repeated.
+  - The two start-together tests do not force an order; the owner-against-sweepers one can pass with the owner winning all 30 rows.
+  - The proxy cuts only at `COMMIT`. A cut during the marker insert or the DDL is covered only by the killed-session test.
+  - Reclaimer against the owner's final write on the EXECUTING side is forced only in the "new owner has claimed" form (the mid-flight test); the open-transaction variants use a drafting row.
+- Notes:
+  - Plain `pytest probes` fails (`No module named 'tests'`); use `python -m pytest probes`.
+  - Docker Desktop was not running at session start; it was started from this session, with `docker compose up -d postgres` only (api and worker were not recreated; the note above about `docker compose up -d` still applies).
+  - Decision D38 added to DESIGN.md; §7.3 and §8 updated; README gained two bullets and extended two, each citing its test file.
 
 ## M5: Idempotency keys
 

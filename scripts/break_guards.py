@@ -101,6 +101,7 @@ MUTATIONS = [
         expected=(
             T + "test_wrong_lease_token_returns_false",
             "tests/test_stale_worker.py::test_stale_drafter_cannot_overwrite_a_new_owner_mid_draft",
+            "tests/test_stale_worker.py::test_stale_executor_cannot_overwrite_a_new_owner_mid_flight",
         ),
         requested=True,
     ),
@@ -154,7 +155,12 @@ MUTATIONS = [
         file="relay/claim.py",
         pattern=r"(LIMIT %\(batch_size\)s\s+FOR UPDATE) SKIP LOCKED",
         replacement=r"\1",
-        expected=(),
+        # Both fail on the waiting sweep's lock timeout: this is a liveness guard (a sweep
+        # must not queue behind another sweep or behind the owner's save), not a safety one.
+        expected=(
+            "tests/test_reclaim_races.py::test_second_reclaimer_skips_a_row_the_first_is_reclaiming",
+            "tests/test_reclaim_races.py::test_reclaimer_skips_a_row_whose_owner_is_saving",
+        ),
     ),
     Mutation(
         name="claim-row-lock",
@@ -207,7 +213,10 @@ MUTATIONS = [
         file="relay/target.py",
         pattern=r" and _rolled_back_cleanly\(target_conn\)",
         replacement="",
-        expected=(E + "test_lost_target_connection_does_not_mark_failed",),
+        expected=(
+            E + "test_lost_target_connection_does_not_mark_failed",
+            "tests/test_timeouts_fire.py::test_idle_in_transaction_timeout_ends_a_stalled_target_transaction",
+        ),
     ),
     Mutation(
         name="lease-recheck",

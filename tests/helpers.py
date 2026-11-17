@@ -142,6 +142,28 @@ def wait_until_blocked(conn, pid: int) -> None:
     raise AssertionError(f"session {pid} never blocked on a lock")
 
 
+def wait_until_migrator_sessions_are_gone(target) -> None:
+    """Return once no relay_migrator session is connected to the database `target` is
+    connected to; fail after THREAD_TIMEOUT.
+
+    Used after a connection was cut or ended by the server: Postgres needs a moment to notice
+    and to roll the dead session's transaction back, and until then its uncommitted rows and
+    locks are still there. `datname = current_database()` limits the check to the test's own
+    target database, so worker sessions of the dev stack (same server, same role, another
+    database) are not counted. The short pause between looks only observes; it creates no race.
+    """
+    deadline = time.monotonic() + THREAD_TIMEOUT
+    while time.monotonic() < deadline:
+        row = target.execute(
+            "SELECT count(*) AS n FROM pg_stat_activity "
+            "WHERE usename = 'relay_migrator' AND datname = current_database()"
+        ).fetchone()
+        if row["n"] == 0:
+            return
+        time.sleep(0.01)
+    raise AssertionError("a relay_migrator session is still connected to the target")
+
+
 def expire_lease(conn, migration_id) -> None:
     """Make a lease look expired by moving its expiry one second into the past.
 
