@@ -1,6 +1,9 @@
 """The marker-first target transaction (core operation 3 of 4; DESIGN.md section 4.3).
 
-This is the only code that changes the target database.
+This is the only code that changes the target database. Two entry points:
+- `apply_on_target`: the core operation. Marker, then DDL, in one transaction.
+- `probe_marker`: the retry-limit check. The same marker insert, then a rollback; it changes
+  nothing, but it waits for an attempt in flight the way `apply_on_target` does.
 
 Words used here:
 - DDL ("data definition language"): a statement that changes the shape of the database, such
@@ -21,6 +24,8 @@ from relay.config import Settings
 APPLIED = "applied"                  # this call inserted the marker and ran the DDL
 ALREADY_APPLIED = "already_applied"  # a marker with the approved hash was there; no DDL was run
 HASH_MISMATCH = "hash_mismatch"      # a marker with a DIFFERENT hash was there; no DDL was run
+# What `probe_marker` returns: ALREADY_APPLIED, HASH_MISMATCH, or
+NOT_APPLIED = "not_applied"          # no marker, and no attempt in flight; the probe left nothing behind
 
 
 class DDLFailed(Exception):
@@ -97,42 +102,20 @@ def apply_on_target(
     step = "begin"
     try:
         with target_conn.transaction():
-            # set_config(name, value, true) is SET LOCAL: it lasts until this transaction
-            # ends. Plain SET cannot take a bound parameter.
-            target_conn.execute("SELECT set_config('lock_timeout', %s, true)", (settings.lock_timeout,))
-            target_conn.execute("SELECT set_config('statement_timeout', %s, true)", (settings.statement_timeout,))
-            target_conn.execute(
-                "SELECT set_config('idle_in_transaction_session_timeout', %s, true)",
-                (settings.target_idle_timeout,),
-            )
+            _set_transaction_timeouts(target_conn, settings)
 
             step = "marker"
-            inserted = target_conn.execute(
-                """
-                INSERT INTO relay_applied (migration_id, sql_hash)
-                VALUES (%(id)s, %(approved_hash)s)
-                ON CONFLICT (migration_id) DO NOTHING
-                RETURNING migration_id
-                """,
-                {"id": migration_id, "approved_hash": approved_hash},
-            ).fetchone()
+            inserted = _insert_marker(target_conn, migration_id, approved_hash)
             hooks.fire("execute.after_marker_insert")
 
-            if inserted is not None:
+            if inserted:
                 step = "ddl"
                 # No parameters: the SQL is sent to the server byte for byte as approved.
                 target_conn.execute(approved_sql)
                 result = APPLIED
             else:
                 step = "read_marker"
-                existing = target_conn.execute(
-                    "SELECT sql_hash FROM relay_applied WHERE migration_id = %s", (migration_id,)
-                ).fetchone()
-                if existing is None:
-                    # The insert conflicted with a marker that is now gone. relay_migrator
-                    # cannot delete markers, so only an administrator could cause this.
-                    raise RuntimeError(f"marker for {migration_id} conflicted and then was not found")
-                result = ALREADY_APPLIED if existing["sql_hash"] == approved_hash else HASH_MISMATCH
+                result = _judge_existing_marker(target_conn, migration_id, approved_hash)
 
             step = "commit"
         # Leaving the `with` block sent COMMIT and got its acknowledgement.
@@ -158,13 +141,101 @@ def _rolled_back_cleanly(target_conn: psycopg.Connection) -> bool:
     )
 
 
-def read_marker_hash(target_conn: psycopg.Connection, migration_id: uuid.UUID) -> str | None:
-    """Read-only: the sql_hash of this migration's marker, or None if there is no marker.
+def probe_marker(
+    target_conn: psycopg.Connection,
+    migration_id: uuid.UUID,
+    approved_hash: str,
+    settings: Settings,
+) -> str:
+    """Find out whether this migration is applied on the target, WITHOUT applying it, and
+    without reaching a verdict while another attempt is still undecided.
 
-    Used when a job is over its retry limit (decision D8): the worker looks before deciding,
-    so a migration that was in fact applied is recorded as SUCCEEDED, not FAILED.
+    Used when a job is over its retry limit (decisions D8 and D39): the worker must choose
+    between SUCCEEDED and FAILED, and an earlier attempt may have committed, or may be inside
+    its target transaction right now.
+
+    One transaction on the target, which never runs the DDL and never commits a marker:
+        1. Set the same three timeouts as `apply_on_target`.
+        2. The same marker INSERT as `apply_on_target` (`_insert_marker`).
+           If another transaction holds an UNcommitted marker for this id, the INSERT waits
+           for it, exactly as the normal path does.
+        3a. A row came back  -> no committed marker exists and no attempt is in flight.
+                                ROLL BACK, so this probe leaves no marker.   Result: NOT_APPLIED
+        3b. No row came back -> a committed marker exists. Read its hash.
+                                Result: ALREADY_APPLIED or HASH_MISMATCH
+
+    Why an INSERT that is thrown away, and not a SELECT: a SELECT cannot see another
+    transaction's uncommitted row and does not wait for it. It would answer "no marker"
+    while an earlier attempt is one COMMIT away from applying the migration, and the job
+    would be marked FAILED and then applied (review finding F1). Only a write to the same
+    primary key waits.
+
+    How it fails: any psycopg error propagates and means NO VERDICT. That includes
+    lock_timeout while waiting for an in-flight attempt, and a lost connection. The caller
+    must write nothing and let its lease expire; the next claim probes again. A probe that
+    dies after its insert leaves nothing behind, because it never sends COMMIT.
+
+    Does not guarantee: that no attempt will START after this returns NOT_APPLIED. A stale
+    worker frozen before its own marker insert can still apply later (the late-apply gap,
+    decision D23). The probe only refuses to decide while an attempt is already in flight.
     """
-    row = target_conn.execute(
+    with target_conn.transaction():
+        _set_transaction_timeouts(target_conn, settings)
+        if _insert_marker(target_conn, migration_id, approved_hash):
+            # Leaving the block with psycopg.Rollback rolls the transaction back and raises
+            # nothing further: the marker inserted one line above is gone again.
+            raise psycopg.Rollback
+        return _judge_existing_marker(target_conn, migration_id, approved_hash)
+    return NOT_APPLIED
+
+
+# ---------- shared steps of the two target transactions ----------
+
+
+def _set_transaction_timeouts(target_conn: psycopg.Connection, settings: Settings) -> None:
+    """Limit this transaction only: how long a statement may wait for a lock, how long it
+    may run, and how long the session may sit idle inside the transaction.
+
+    set_config(name, value, true) is SET LOCAL: it lasts until this transaction ends. Plain
+    SET cannot take a bound parameter.
+    """
+    target_conn.execute("SELECT set_config('lock_timeout', %s, true)", (settings.lock_timeout,))
+    target_conn.execute("SELECT set_config('statement_timeout', %s, true)", (settings.statement_timeout,))
+    target_conn.execute(
+        "SELECT set_config('idle_in_transaction_session_timeout', %s, true)",
+        (settings.target_idle_timeout,),
+    )
+
+
+def _insert_marker(target_conn: psycopg.Connection, migration_id: uuid.UUID, approved_hash: str) -> bool:
+    """The marker step, in the caller's open target transaction. The ONE place the marker
+    INSERT is written, so the normal path and the retry-limit probe cannot drift apart.
+
+    True  -> this transaction inserted the marker (it is still uncommitted).
+    False -> a COMMITTED marker for this migration already exists; nothing was inserted.
+    If another transaction holds an uncommitted marker for the same id, this waits for it
+    (up to lock_timeout): commit there means False here, rollback there means True here.
+    """
+    inserted = target_conn.execute(
+        """
+        INSERT INTO relay_applied (migration_id, sql_hash)
+        VALUES (%(id)s, %(approved_hash)s)
+        ON CONFLICT (migration_id) DO NOTHING
+        RETURNING migration_id
+        """,
+        {"id": migration_id, "approved_hash": approved_hash},
+    ).fetchone()
+    return inserted is not None
+
+
+def _judge_existing_marker(target_conn: psycopg.Connection, migration_id: uuid.UUID, approved_hash: str) -> str:
+    """After `_insert_marker` returned False: read the committed marker and compare hashes.
+    An existing marker counts as success only if its sql_hash is the approved one."""
+    existing = target_conn.execute(
         "SELECT sql_hash FROM relay_applied WHERE migration_id = %s", (migration_id,)
     ).fetchone()
-    return None if row is None else row["sql_hash"]
+    if existing is None:
+        # The insert conflicted with a marker that is now gone. relay_migrator cannot
+        # delete markers, so only an administrator could cause this.
+        raise RuntimeError(f"marker for {migration_id} conflicted and then was not found")
+    return ALREADY_APPLIED if existing["sql_hash"] == approved_hash else HASH_MISMATCH

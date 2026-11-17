@@ -164,6 +164,34 @@ def wait_until_migrator_sessions_are_gone(target) -> None:
     raise AssertionError("a relay_migrator session is still connected to the target")
 
 
+def wait_until_a_migrator_session_is_blocked(target) -> None:
+    """Return once some relay_migrator session in the database `target` is connected to is
+    waiting for a lock; fail after THREAD_TIMEOUT.
+
+    Like `wait_until_blocked`, but for a worker's target connection, whose session id the
+    test cannot know in advance (the worker opens it per job). Limited to the test's own
+    target database, so dev workers on the same server are not counted.
+    """
+    deadline = time.monotonic() + THREAD_TIMEOUT
+    while time.monotonic() < deadline:
+        row = target.execute(
+            "SELECT count(*) AS n FROM pg_stat_activity "
+            "WHERE usename = 'relay_migrator' AND datname = current_database() "
+            "AND wait_event_type = 'Lock'"
+        ).fetchone()
+        if row["n"] > 0:
+            return
+        time.sleep(0.01)
+    raise AssertionError("no relay_migrator session ever blocked on a lock")
+
+
+def use_up_attempts(conn, migration_id, attempts: int) -> None:
+    """Test setup: make a queued job look as if it had already been claimed `attempts` times
+    in this phase, without running those attempts. Touches only `attempts`, never `status`.
+    """
+    conn.execute("UPDATE migrations SET attempts = %s WHERE id = %s", (attempts, migration_id))
+
+
 def expire_lease(conn, migration_id) -> None:
     """Make a lease look expired by moving its expiry one second into the past.
 

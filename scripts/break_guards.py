@@ -123,6 +123,8 @@ MUTATIONS = [
         guard="the INSERT into relay_applied (the DDL then runs with no marker)",
         invariant="4",
         file="relay/target.py",
+        # The statement lives in `_insert_marker`, shared by apply_on_target and the
+        # retry-limit probe (decision D39). The mutant claims "inserted" without inserting.
         pattern=r'inserted = target_conn\.execute\(\s+"""\s+INSERT INTO relay_applied.*?\)\.fetchone\(\)',
         replacement='inserted = {"migration_id": migration_id}  # MUTANT: marker insert removed',
         expected=(
@@ -186,10 +188,10 @@ MUTATIONS = [
     ),
     Mutation(
         name="marker-result-ignored",
-        guard="`if inserted is not None` (the DDL runs whatever the marker insert returned)",
+        guard="`if inserted:` in apply_on_target (the DDL runs whatever the marker insert returned)",
         invariant="4",
         file="relay/target.py",
-        pattern=r"if inserted is not None:",
+        pattern=r"if inserted:",
         replacement="if True:  # MUTANT: run the DDL even when a marker already exists",
         expected=(
             E + "test_existing_marker_with_matching_hash_skips_ddl_and_succeeds",
@@ -202,9 +204,26 @@ MUTATIONS = [
         guard="the sql_hash comparison on an existing marker (any marker counts as success)",
         invariant="4",
         file="relay/target.py",
-        pattern=r'result = ALREADY_APPLIED if existing\["sql_hash"\] == approved_hash else HASH_MISMATCH',
-        replacement="result = ALREADY_APPLIED  # MUTANT: hash not compared",
-        expected=(E + "test_existing_marker_with_different_hash_fails",),
+        # In `_judge_existing_marker`, shared by apply_on_target and the retry-limit probe.
+        pattern=r'return ALREADY_APPLIED if existing\["sql_hash"\] == approved_hash else HASH_MISMATCH',
+        replacement="return ALREADY_APPLIED  # MUTANT: hash not compared",
+        expected=(
+            E + "test_existing_marker_with_different_hash_fails",
+            "tests/test_retry_limit.py::test_execution_at_limit_with_a_different_hash_marker_fails_and_says_so",
+        ),
+    ),
+    Mutation(
+        name="probe-rollback",
+        guard="the ROLLBACK of the retry-limit probe's own marker insert (the probe then sees "
+              "its own marker, reports 'applied', and commits a marker with no DDL)",
+        invariant="4 (decision D39)",
+        file="relay/target.py",
+        pattern=r"raise psycopg\.Rollback",
+        replacement="pass  # MUTANT: the probe keeps its marker",
+        expected=(
+            "tests/test_retry_limit.py::test_execution_at_limit_without_marker_fails",
+            "tests/test_retry_limit.py::test_execution_at_limit_waits_for_an_in_flight_attempt_and_fails_when_it_rolls_back",
+        ),
     ),
     Mutation(
         name="rollback-confirmed",

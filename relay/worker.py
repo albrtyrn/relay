@@ -34,7 +34,7 @@ from relay.config import (
 )
 from relay.llm import RISK_LEVELS, LLMClient, LLMPermanentError, LLMTransientError, get_llm
 from relay.sqlhash import sha256_hex
-from relay.target import HASH_MISMATCH, DDLFailed, apply_on_target, read_marker_hash
+from relay.target import ALREADY_APPLIED, HASH_MISMATCH, DDLFailed, apply_on_target, probe_marker
 from relay.transitions import transition
 
 log = logging.getLogger("relay.worker")
@@ -230,8 +230,17 @@ class Worker:
         """The job is over its retry limit for this phase (decision D8).
 
         A draft has no side effects, so it simply fails. An execution may have committed on
-        the target in an earlier attempt that died before telling Relay, so look at the
-        marker first: a marker with the approved hash means the migration IS applied.
+        the target in an earlier attempt that died before telling Relay, or an earlier
+        attempt may be inside its target transaction at this moment. So ask the target with
+        `probe_marker`, which waits for an attempt in flight instead of deciding around it
+        (decision D39):
+
+            T1' (target txn)   marker insert as a question, then ROLLBACK  -> relay/target.py
+            R4' (Relay txn)    EXECUTING -> SUCCEEDED or FAILED, guarded by my token
+
+        No Relay transaction is open during T1'. No lease re-check is needed before it
+        (unlike T1): the probe never applies anything, so starting it late is harmless, and
+        the final write is refused anyway if the job is no longer mine.
         """
         if claim.status == "DRAFTING":
             return self._fail(claim, "retry limit reached")
@@ -239,14 +248,21 @@ class Worker:
         try:
             target_conn = db.connect(self.settings.target_db_dsn)
             try:
-                marker_hash = read_marker_hash(target_conn, claim.id)
+                verdict = probe_marker(target_conn, claim.id, claim.approved_sql_hash, self.settings)
             finally:
                 target_conn.close()
         except psycopg.Error as error:
-            log.warning("job %s: cannot read the marker, abandoning the lease: %s", claim.id, error)
+            # No verdict: the target is unreachable, or the probe timed out waiting for an
+            # attempt that is still in flight. Never FAILED on an unknown outcome; the next
+            # claim (still over the limit) probes again.
+            log.warning("job %s: no verdict from the marker probe, abandoning the lease: %s", claim.id, error)
             return ABANDONED
-        if marker_hash is not None and marker_hash == claim.approved_sql_hash:
+        if verdict == ALREADY_APPLIED:
             return self._succeed(claim)
+        if verdict == HASH_MISMATCH:
+            # Not applied as approved, and something else claims this migration id on the
+            # target. Say so: the anomaly should not hide behind the retry limit.
+            return self._fail(claim, "retry limit reached; target marker exists with a different hash")
         return self._fail(claim, "retry limit reached")
 
     def _fail(self, claim: Claim, error: str) -> str:

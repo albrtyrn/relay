@@ -81,7 +81,7 @@ relay/
 │   ├── idempotency.py      [core] key reservation and replay (M5)
 │   ├── api.py              FastAPI app, routes, Pydantic models, error mapping
 │   ├── claim.py            [core] claim query; also the reclaim sweep
-│   ├── target.py           [core] marker-first target transaction (M4)
+│   ├── target.py           [core] marker-first target transaction (M4); also the retry-limit probe (D39)
 │   ├── policy.py           pglast allow-list (§6.2)
 │   ├── hooks.py            named pause/crash points for tests and the demo (§7.5)
 │   ├── worker.py           worker loop, draft step, execute step; `python -m relay.worker`
@@ -447,6 +447,34 @@ Outcomes:
 | **0 rows on the final Relay write** | Lease was lost. Stop. Whoever holds the job now will find the marker. |
 | **Invariant** | 4 (marker first, same transaction, hash must match), and the "no transaction spans both databases" rule. |
 
+#### Retry-limit probe (`probe_marker`, D39)
+
+At the execution retry limit the worker must choose between `SUCCEEDED` and `FAILED`, and an earlier attempt may have committed on the target, or may be inside its target transaction right now. The check therefore uses the same marker `INSERT` as above (one shared function, `_insert_marker`), in a transaction that never runs the DDL and never commits a marker:
+
+```sql
+-- BEGIN
+-- the same three set_config(..., true) timeouts as above
+INSERT INTO relay_applied (migration_id, sql_hash)
+VALUES (%(id)s, %(approved_hash)s)
+ON CONFLICT (migration_id) DO NOTHING
+RETURNING migration_id;
+
+-- a row came back: no committed marker, and no attempt in flight
+ROLLBACK;                                  -- result NOT_APPLIED; the probe leaves nothing
+
+-- no row came back: a committed marker exists
+SELECT sql_hash FROM relay_applied WHERE migration_id = %(id)s;
+-- COMMIT (nothing to commit)             -- result ALREADY_APPLIED or HASH_MISMATCH
+```
+
+| | |
+| --- | --- |
+| **Why an `INSERT` and not a `SELECT`** | A `SELECT` cannot see another transaction's uncommitted row and does not wait for it. It would answer "no marker" while an earlier attempt is one `COMMIT` away from applying the migration (review finding F1). An insert of the same primary key waits. |
+| **Conflict** | An earlier attempt holds an uncommitted marker: the probe waits. It commits → no row → read the hash. It rolls back → a row → `NOT_APPLIED`. The wait outlasts `lock_timeout` → error → no verdict; the worker abandons the lease and the next claim probes again. The target's idle timeout ends a stalled attempt, so this does not repeat forever. |
+| **Crash or lost connection mid-probe** | The probe never sends `COMMIT`, so the server rolls its marker back. |
+| **Lease** | No lease re-check before the probe (unlike D33 before T1): it applies nothing, so starting it late is harmless. The final Relay write still carries the token. |
+| **Does not guarantee** | That no attempt *starts* after `NOT_APPLIED`. A stale worker frozen before its own marker insert can still apply later; that is the late-apply gap (§1 #5, D23), unchanged. |
+
 ### 4.4 Idempotency reservation **[core]** (M5)
 
 Wraps approve and reject. `request_hash = sha256(canonical JSON of {"migration_id": ..., "body": ...})` with sorted keys.
@@ -549,9 +577,13 @@ execute(claim):                                 # acts on APPROVED jobs
 
 exhausted(claim):                               # retry limit reached
       DRAFTING:  R3' transition(DRAFTING -> FAILED, token, error = 'retry limit reached')
-      EXECUTING: read the marker on the target (read-only);
-                 matching hash -> R4' transition(EXECUTING -> SUCCEEDED, token)
-                 otherwise     -> R4' transition(EXECUTING -> FAILED, token, error = 'retry limit reached')
+      EXECUTING: T1' probe_marker(...)             # target txn, §4.3 "Retry-limit probe"; no Relay txn open
+                 ALREADY_APPLIED -> R4' transition(EXECUTING -> SUCCEEDED, token)
+                 NOT_APPLIED     -> R4' transition(EXECUTING -> FAILED, token, error = 'retry limit reached')
+                 HASH_MISMATCH   -> R4' transition(EXECUTING -> FAILED, token,
+                                        error = 'retry limit reached; target marker exists with a different hash')
+                 any target error (unreachable, lock_timeout behind an attempt in flight)
+                                 -> no write; "abandoned"; the next claim probes again
 ```
 
 `run_forever` sleeps `POLL_SECONDS` (plus a little random jitter so workers do not poll in step) when `run_once` returns `idle`, and finishes the current job before exiting on `SIGTERM`.
@@ -845,6 +877,16 @@ No production code changed. These came from the review's probes (REVIEW.md §5 a
 - `test_timeouts_fire.py::test_idle_in_transaction_timeout_ends_a_stalled_target_transaction` (fails without `_rolled_back_cleanly`)
 - `test_stale_worker.py::test_stale_executor_cannot_overwrite_a_new_owner_mid_flight` (the executing twin of the mid-draft test; fails without the helper's `lease_token` condition)
 
+### Review follow-up 2: the retry-limit check waits (F1, D39; 2026-11-16)
+
+`target.py::probe_marker` replaces `read_marker_hash`; `worker.py::_exhausted` uses it. The first four tests below failed before the change (red run recorded in PROGRESS.md).
+
+- `test_retry_limit.py::test_execution_at_limit_does_not_fail_a_job_whose_earlier_attempt_is_still_in_flight` (earlier attempt held open; 300 ms `lock_timeout`; `abandoned`, then `SUCCEEDED` after it commits)
+- `test_retry_limit.py::test_execution_at_limit_waits_for_an_in_flight_attempt_and_succeeds_when_it_commits` (the probe is seen blocked)
+- `test_retry_limit.py::test_execution_at_limit_waits_for_an_in_flight_attempt_and_fails_when_it_rolls_back` (also: the probe leaves no marker)
+- `test_retry_limit.py::test_execution_at_limit_with_a_different_hash_marker_fails_and_says_so`
+- `test_retry_limit.py::test_execution_at_limit_without_marker_fails` (existing; now also the test that the probe's own insert is rolled back)
+
 ### M5: Idempotency keys
 
 `idempotency_keys` table, `idempotency.py` [core], header required on approve and reject.
@@ -879,7 +921,7 @@ No production code changed. These came from the review's probes (REVIEW.md §5 a
 | D5 | No lease renewal | Heartbeat thread extending the lease | A second thread and connection per worker for work bounded at ~40 s. Timeouts are set under the lease instead. |
 | D6 | A worker's write checks only token and status, not `lease_expires_at > now()` | Also require an unexpired lease | Until someone reclaims the row, nobody else can be working on it, so accepting the late write is safe and avoids redoing finished work. |
 | D7 | Retry = abandon the lease | A worker-initiated "release" transition | One recovery path to build, test, and explain. Cost: a transient failure waits up to `LEASE_SECONDS` before retry. |
-| D8 | **Accepted 2026-11-16.** Retry limit pulled into M3/M4, enforced by the claiming worker; execution at the limit reads the marker before deciding | Defer to Phase 2 (PLAN); or have the reclaim sweep mark `FAILED` | Without it a poison job loops forever through the whole core build. The claimer holds a lease, so the write satisfies invariant 3, and reading the marker avoids marking `FAILED` a migration that actually applied. |
+| D8 | **Accepted 2026-11-16.** Retry limit pulled into M3/M4, enforced by the claiming worker; execution at the limit reads the marker before deciding | Defer to Phase 2 (PLAN); or have the reclaim sweep mark `FAILED` | Without it a poison job loops forever through the whole core build. The claimer holds a lease, so the write satisfies invariant 3, and reading the marker avoids marking `FAILED` a migration that actually applied. **Changed by D39:** the "read" is now a waiting probe (marker `INSERT`, then rollback), not a plain `SELECT`. |
 | D9 | **Accepted 2026-11-16 for v1.** DDL errors, including both timeouts, are terminal `FAILED`; unknown outcomes retry. A timeout on the marker insert is classified separately as contention and retries (§4.3) | Retry `lock_timeout` automatically | Deterministic and simple; avoids a retry storm against a locked table. Revisit in Phase 2 alongside the `lock_timeout` test. |
 | D10 | Lease times use the database clock; tests backdate `lease_expires_at` | Inject a Python clock; real short leases with sleeps | One clock shared by all workers, no drift. Backdating is instant and deterministic. |
 | D11 | Hash is sha256 of the exact stored text | Normalize whitespace/case, or hash the parse tree | "Approved this exact statement" should mean byte-for-byte. Nothing edits the SQL in v1, so normalization buys nothing. |
@@ -911,6 +953,7 @@ No production code changed. These came from the review's probes (REVIEW.md §5 a
 | D36 | **Accepted 2026-11-16 (M4).** `scripts/demo_crash.py` is built in M4, not Phase 2. It kills a worker *subprocess* with SIGKILL, runs on its own `relay_demo` / `target_demo` databases, and waits out a real 15-second lease (with `LOCK_TIMEOUT=1s`, `STATEMENT_TIMEOUT=2s` to satisfy D33) | Phase 2 (PLAN); kill a Compose container; run on the dev databases; backdate the lease as tests do | Albert asked for it with M4. A subprocess needs no Docker socket inside the container and dies the same way. On the dev databases the two Compose workers would race the demo for its job. A demo should show the real wait; tests are where time is faked. |
 | D37 | **Added at M4.** `run_once()` gains the outcome `succeeded`, and `lost` also covers "my lease had too little time left to begin target work" (extends D31) | Reuse `saved` for a finished execution; a separate `expired` outcome | Tests and the demo need to tell a draft saved from a migration applied. In both `lost` cases the worker does the same thing: stop and write nothing. |
 | D38 | **Accepted 2026-11-16 (review follow-up 1).** A connection lost during the target `COMMIT` is tested with a TCP relay written in the test file with standard-library sockets (`CommitCuttingProxy`), which cuts the connection when it sees the `COMMIT` message, in two modes: after the server processed it, or before it arrived | `pg_terminate_backend` from a hook (what `test_lost_target_connection_does_not_mark_failed` uses); an external fault-injection proxy such as Toxiproxy; a fake connection object | Killing the session cannot be aimed at the instant between "`COMMIT` sent" and "answer received", and that instant is the only place where the outcome is truly unknown. An external proxy is a new dependency and a new Compose service for about 60 lines of sockets. A fake connection would break invariant 5: the point is what real Postgres does with a half-finished commit. Cost: the proxy finds `COMMIT` by its bytes in one network read, which relies on how psycopg ends a transaction block; each test asserts the cut happened, so a change there fails loudly. |
+| D39 | **Accepted 2026-11-16 (review follow-up 2, finding F1).** At the execution retry limit the worker asks the target with `probe_marker`: the same marker `INSERT` as the normal path, inside a target transaction that is rolled back if the insert succeeded. Results: `ALREADY_APPLIED` → `SUCCEEDED`; `NOT_APPLIED` → `FAILED` "retry limit reached"; `HASH_MISMATCH` → `FAILED` "retry limit reached; target marker exists with a different hash"; any target error → no write, lease abandoned. The marker `INSERT` is written once (`_insert_marker`) and shared with `apply_on_target`. | A plain `SELECT` of the marker (D8 as first built); commit a "tombstone" marker with a fake hash so later stale attempts are refused; `LOCK TABLE relay_applied` then `SELECT`; only widen the README non-guarantee; keep the bare "retry limit reached" for a hash mismatch | The `SELECT` does not wait for an attempt that is inside its target transaction, so Relay could say `FAILED` for a migration that then committed (reproduced in the review). A tombstone would close more of the late-apply gap but changes what a marker means ("this was applied"); that is fencing and belongs with D23. `relay_migrator` has only `SELECT` and `INSERT` on the table, and the lock modes those allow do not conflict with another session's insert. A marker with a different hash is an anomaly a person should see, so the message names it. Cost: the check can now wait up to `LOCK_TIMEOUT`, and a job over the limit whose earlier attempt is stuck costs one lease per retry until the target's idle timeout ends that attempt. **Still open:** an attempt that *starts* after the probe (D23). Tested in `test_retry_limit.py`; mutation `probe-rollback`. |
 
 ---
 

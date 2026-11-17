@@ -3,13 +3,14 @@
 What is left here are the probes that are NOT tests of a guarantee:
 
 - `finding_...` probes assert the BAD outcome on purpose, to demonstrate a finding.
-- `contrast_...` shows the safe behavior next to a finding.
 - `measure_...` probes only print what they observe.
 
 The probes that asserted what DESIGN.md says should happen (the reclaim races, the COMMIT
 cut, the timeouts firing, the mid-flight executor) became real tests on 2026-11-16:
 tests/test_reclaim_races.py, tests/test_commit_cut.py, tests/test_timeouts_fire.py, and
 tests/test_stale_worker.py::test_stale_executor_cannot_overwrite_a_new_owner_mid_flight.
+The F1 finding (retry limit decided by a read that did not wait) was fixed the same day; its
+probe became tests in tests/test_retry_limit.py.
 
 Run with: docker compose run --rm tests python -m pytest probes -s
 """
@@ -22,66 +23,20 @@ import pytest
 from fastapi.testclient import TestClient
 from psycopg.conninfo import make_conninfo
 
-from relay import db, policy, service, worker
+from relay import db, policy, service
 from relay.api import create_app
 from relay.claim import reclaim_expired
-from relay.sqlhash import sha256_hex
 from relay.transitions import transition
 from tests.helpers import (
     SEED_HASH,
     Background,
-    columns_of,
     expire_lease,
-    markers_of,
     run_behind_barrier,
     seed_migration,
     wait_until_blocked,
 )
 
-ADD = "ALTER TABLE public.customers ADD COLUMN nickname text"
 CLEAR = {"lease_token": None, "lease_expires_at": None}
-
-
-def row_of(conn, mid):
-    return conn.execute(
-        "SELECT status, error, lease_token, attempts FROM migrations WHERE id = %s", (mid,)
-    ).fetchone()
-
-
-# ---------------------------------------------------------------- F1
-
-
-def test_finding_retry_limit_reads_marker_without_waiting(conn, target, migrator, make_worker):
-    """A stale attempt is INSIDE its target transaction (marker inserted, not committed) when
-    a later attempt, now over the retry limit, looks at the marker. The read does not wait,
-    sees nothing, and marks FAILED. The stale attempt then commits."""
-    mid = seed_migration(conn, status="APPROVED", sql=ADD)
-    conn.execute("UPDATE migrations SET attempts = 1 WHERE id = %s", (mid,))    # one attempt already used
-    b = make_worker("b", max_attempts=1)
-    with migrator.transaction():                                               # the stale attempt "A"
-        migrator.execute("INSERT INTO relay_applied (migration_id, sql_hash) VALUES (%s, %s)", (mid, sha256_hex(ADD)))
-        migrator.execute(ADD)
-        outcome = b.run_once()
-    row = row_of(conn, mid)
-    print(f"\nFINDING retry-limit: worker outcome {outcome}; Relay = {row['status']} ({row['error']}); "
-          f"target marker = {mid in markers_of(target)}, column = {'nickname' in columns_of(target, 'customers')}")
-    assert outcome == worker.FAILED
-    assert row["status"] == "FAILED"
-    assert markers_of(target) == {mid: sha256_hex(ADD)}          # applied on the target
-    assert "nickname" in columns_of(target, "customers")
-
-
-def test_contrast_under_the_limit_the_marker_insert_waits(conn, target, migrator, make_worker):
-    """Same situation, but attempts are under the limit: the normal path's marker INSERT waits
-    on the stale attempt's marker, times out, and writes nothing (safe)."""
-    mid = seed_migration(conn, status="APPROVED", sql=ADD)
-    b = make_worker("b", lock_timeout="300ms")
-    with migrator.transaction():
-        migrator.execute("INSERT INTO relay_applied (migration_id, sql_hash) VALUES (%s, %s)", (mid, sha256_hex(ADD)))
-        migrator.execute(ADD)
-        outcome = b.run_once()
-    assert outcome == worker.ABANDONED
-    assert row_of(conn, mid)["status"] == "EXECUTING"
 
 
 # ---------------------------------------------------------------- F3

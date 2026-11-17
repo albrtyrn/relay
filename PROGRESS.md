@@ -12,8 +12,8 @@ Status values: `not started`, `in progress`, `done`.
 - **Run `docker compose up -d` once:** `TARGET_MIGRATOR_PASSWORD` is now in `.env`, and the last test runs set the `relay_migrator` role to that value. The api and worker containers were created earlier with a shell-supplied password (`localtestonly1`), so until they are recreated the running workers cannot log in to `target_db` (an approved job would be abandoned and retried, not failed).
 - **Done since:** skeptical review of M1 to M4 (REVIEW.md, findings F1 to F10) and `scripts/break_guards.py` (mutation check). Nothing in `relay/` changed. The review's 27 probes are in `probes/` (not collected by default).
 - **Done since:** review follow-up 1 (plan approved by Albert first): 13 probes became tests; no file in `relay/` changed; the full suite passes (283 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit.
+- **Done since:** review follow-up 2, F1 (plan approved by Albert first): the retry-limit check is now a waiting probe (D39); the full suite passes (287 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit.
 - **Next:** the remaining review follow-ups, in this order, one plan at a time, each waiting for Albert's OK:
-  2. F1: the retry-limit check waits (marker `INSERT` inside a target transaction, then roll back) instead of a plain `SELECT`. The F1 probe becomes a test that fails before the fix.
   3. F3: `lock_timeout` and `idle_in_transaction_session_timeout` on `relay_db` connections, including how the API answers a lock timeout and what the worker does with one.
   4. F4(b): target connection failures do not count toward `MAX_ATTEMPTS`. D9 stays as it is.
   Then M5 (idempotency keys), which also needs a plan and Albert's OK first.
@@ -208,6 +208,33 @@ Status values: `not started`, `in progress`, `done`.
   - Plain `pytest probes` fails (`No module named 'tests'`); use `python -m pytest probes`.
   - Docker Desktop was not running at session start; it was started from this session, with `docker compose up -d postgres` only (api and worker were not recreated; the note above about `docker compose up -d` still applies).
   - Decision D38 added to DESIGN.md; §7.3 and §8 updated; README gained two bullets and extended two, each citing its test file.
+
+### 2. F1: the retry-limit check waits
+
+- Status: in progress (all checks pass; waiting on Albert's review)
+- Started: 2026-11-16 / Finished:
+- Scope: `relay/target.py::probe_marker` (replaces `read_marker_hash`), with the marker `INSERT`, the timeouts, and the hash comparison moved into three private functions shared with `apply_on_target`; `relay/worker.py::_exhausted` maps the probe's result. Albert's two choices: one shared marker `INSERT`; a hash mismatch at the limit says "retry limit reached; target marker exists with a different hash".
+- Checks:
+  - [x] `test_retry_limit.py`: four new tests (in flight then `abandoned`; waits then `SUCCEEDED`; waits then `FAILED`; different-hash message), and the existing no-marker test now also covers "the probe leaves no marker"
+  - [x] `scripts/break_guards.py`: `marker-result-ignored` and `marker-hash-compare` patterns updated to the moved code; `marker-insert` pattern still matches exactly once (comment added); new mutation `probe-rollback`
+  - [x] `probes/`: the F1 finding and its contrast probe removed (12 collected now)
+- Last test run (PowerShell):
+  - Red run first: `docker compose run --rm tests pytest tests/test_retry_limit.py -q -p no:cacheprovider` -> `4 failed, 4 passed`. Test 1: `assert 'failed' == 'abandoned'` (the worker wrote `FAILED` beside an uncommitted marker). Tests 2 and 3: `no relay_migrator session ever blocked on a lock` (the old read never waits). Test 4: the error was the bare `retry limit reached`.
+  - After the change: same command -> `8 passed`.
+  - `docker compose run --rm tests pytest -q -p no:cacheprovider` -> `287 passed, 1 warning`.
+  - `python scripts/break_guards.py --only marker-insert marker-result-ignored marker-hash-compare probe-rollback rollback-confirmed --repeat 3` (host) -> baseline 13 passed; all five `CAUGHT` in 3 runs of 3 (6, 4, 2, 2, 2 expected tests failed).
+  - Repeat loop over retry limit, execute, marker contention, timeouts, commit cut, crash after target commit, worker contention, stale worker -> `38 passed` 20 times out of 20.
+  - `docker compose run --rm tests python -m pytest probes -q -p no:cacheprovider` -> `12 passed`.
+  - `docker compose run --rm tests python -m scripts.demo_crash` -> exit 0, final state `SUCCEEDED`.
+- Not yet tested:
+  - What F1 does NOT fix, by design: a stale attempt that begins its target transaction *after* the probe returned `NOT_APPLIED` (including one whose marker insert was waiting on the probe's own marker). That is the late-apply gap (D23).
+  - The probe losing its connection after its insert (expected: `abandoned`, nothing left on the target). Reasoned from "never sends `COMMIT`"; not forced.
+  - A job that is abandoned at the limit repeatedly because the earlier attempt stays stuck; only one abandon-then-succeed cycle is tested.
+  - Target unreachable at the retry limit (expected: `abandoned`), as before.
+  - The `--full` mutation run over every guard was not repeated; the five mutations in `target.py` and the three from follow-up 1 were.
+- Notes:
+  - Decision D39 added; D8 points to it; DESIGN §4.3 gained "Retry-limit probe", §5 and §8 updated. README's retry-limit bullet extended.
+  - Behavior change visible to users: a different-hash marker at the limit now has its own error text; the check can take up to `LOCK_TIMEOUT`.
 
 ## M5: Idempotency keys
 
