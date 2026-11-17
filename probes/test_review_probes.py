@@ -1,21 +1,20 @@
 """Review probes: experiments from the skeptical review (REVIEW.md).
 
-What is left here are the probes that are NOT tests of a guarantee:
+What is left here are `measure_...` probes: they are NOT tests of a guarantee, they only
+print what they observe.
 
-- `finding_...` probes assert the BAD outcome on purpose, to demonstrate a finding.
-- `measure_...` probes only print what they observe.
-
-The probes that asserted what DESIGN.md says should happen (the reclaim races, the COMMIT
-cut, the timeouts firing, the mid-flight executor) became real tests on 2026-11-16:
-tests/test_reclaim_races.py, tests/test_commit_cut.py, tests/test_timeouts_fire.py, and
-tests/test_stale_worker.py::test_stale_executor_cannot_overwrite_a_new_owner_mid_flight.
-The F1 finding (retry limit decided by a read that did not wait) was fixed the same day; its
-probe became tests in tests/test_retry_limit.py.
+Everything else became real tests on 2026-11-16:
+- the probes that asserted what DESIGN.md says should happen (the reclaim races, the COMMIT
+  cut, the timeouts firing, the mid-flight executor): tests/test_reclaim_races.py,
+  tests/test_commit_cut.py, tests/test_timeouts_fire.py, and
+  tests/test_stale_worker.py::test_stale_executor_cannot_overwrite_a_new_owner_mid_flight;
+- the F1 finding (retry limit decided by a read that did not wait), fixed:
+  tests/test_retry_limit.py;
+- the F3 finding (no timeouts on Relay connections), fixed: tests/test_relay_timeouts.py.
 
 Run with: docker compose run --rm tests python -m pytest probes -s
 """
 
-import time
 import uuid
 from collections import Counter
 
@@ -23,57 +22,9 @@ import pytest
 from fastapi.testclient import TestClient
 from psycopg.conninfo import make_conninfo
 
-from relay import db, policy, service
+from relay import policy, service
 from relay.api import create_app
-from relay.claim import reclaim_expired
-from relay.transitions import transition
-from tests.helpers import (
-    SEED_HASH,
-    Background,
-    expire_lease,
-    run_behind_barrier,
-    seed_migration,
-    wait_until_blocked,
-)
-
-CLEAR = {"lease_token": None, "lease_expires_at": None}
-
-
-# ---------------------------------------------------------------- F3
-
-
-def test_measure_relay_connections_have_no_timeouts(conn):
-    values = {
-        name: conn.execute("SELECT current_setting(%s) AS v", (name,)).fetchone()["v"]
-        for name in ("lock_timeout", "statement_timeout", "idle_in_transaction_session_timeout", "tcp_user_timeout")
-    }
-    print("\nMEASURE relay connection timeouts:", values)
-
-
-def test_finding_frozen_reclaimer_blocks_the_owner_forever(conn, settings):
-    """Nothing bounds how long a Relay transaction may hold a row lock. If a process freezes
-    inside reclaim, the owner's save waits with no timeout."""
-    mid = seed_migration(conn, status="DRAFTING")
-    token = conn.execute("SELECT lease_token FROM migrations WHERE id = %s", (mid,)).fetchone()["lease_token"]
-    expire_lease(conn, mid)
-    with db.connect(settings.relay_db_dsn) as frozen, db.connect(settings.relay_db_dsn) as owner:
-        with frozen.transaction():
-            reclaim_expired(frozen, "frozen")
-
-            def save():
-                with owner.transaction():
-                    return transition(owner, mid, "DRAFTING", "FAILED", "worker:o", lease_token=token,
-                                      set_fields={"error": "x", **CLEAR})
-
-            thread = Background(save)
-            wait_until_blocked(conn, owner.info.backend_pid)
-            time.sleep(2)   # observation only: still blocked two seconds later, nothing times it out
-            state = conn.execute(
-                "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (owner.info.backend_pid,)
-            ).fetchone()["wait_event_type"]
-            print("\nFINDING owner's save after 2s behind a frozen reclaim:", state)
-            assert state == "Lock"
-        assert thread.join() is False
+from tests.helpers import SEED_HASH, run_behind_barrier, seed_migration
 
 
 # ---------------------------------------------------------------- measurements

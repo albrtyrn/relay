@@ -2,7 +2,8 @@
 
 Each milestone adds the variables it first uses (decision D24). M1: the relay_db connection
 string. M3: the worker's settings, all optional with the defaults below. M4: the target
-connection string and the three target timeouts.
+connection string and the three target timeouts. Review follow-up 3: the two timeouts on
+Relay's own connections.
 `ADMIN_DSN` and `TARGET_MIGRATOR_PASSWORD` are not part of Settings: only dbinit and the
 tests use them, never the running API or worker.
 `RELAY_HOOK` is not here either: relay/hooks.py reads it, and it is unset outside tests.
@@ -53,6 +54,16 @@ class Settings:
     # The longest the transaction may sit open doing nothing between statements; after that
     # Postgres ends the session and rolls the transaction back (DESIGN.md section 1 #5).
     target_idle_timeout: str = "30s"
+    # Limits on Relay's OWN connections (API requests and workers), set for the whole
+    # session by db.connect_relay (decision D40). Same <whole number><ms|s|min> format.
+    # relay_lock_timeout: the longest one statement may wait for a row lock on relay_db.
+    # After it the API answers 503 and a worker abandons its lease.
+    relay_lock_timeout: str = "5s"
+    # relay_idle_timeout: the longest a Relay session may sit INSIDE an open transaction
+    # doing nothing before Postgres ends it and rolls the transaction back. Relay's
+    # transactions take milliseconds, so only a frozen process ever reaches this. A session
+    # that is idle with no transaction open is never affected.
+    relay_idle_timeout: str = "10s"
 
 
 def timeout_seconds(text: str) -> float:
@@ -128,6 +139,8 @@ def load_settings(env: dict | None = None) -> Settings:
         lock_timeout=env.get("LOCK_TIMEOUT", "5s"),
         statement_timeout=env.get("STATEMENT_TIMEOUT", "15s"),
         target_idle_timeout=env.get("TARGET_IDLE_TIMEOUT", "30s"),
+        relay_lock_timeout=env.get("RELAY_LOCK_TIMEOUT", "5s"),
+        relay_idle_timeout=env.get("RELAY_IDLE_TIMEOUT", "10s"),
     )
 
 

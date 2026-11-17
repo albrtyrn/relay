@@ -13,8 +13,8 @@ Status values: `not started`, `in progress`, `done`.
 - **Done since:** skeptical review of M1 to M4 (REVIEW.md, findings F1 to F10) and `scripts/break_guards.py` (mutation check). Nothing in `relay/` changed. The review's 27 probes are in `probes/` (not collected by default).
 - **Done since:** review follow-up 1 (plan approved by Albert first): 13 probes became tests; no file in `relay/` changed; the full suite passes (283 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit.
 - **Done since:** review follow-up 2, F1 (plan approved by Albert first): the retry-limit check is now a waiting probe (D39); the full suite passes (287 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit.
-- **Next:** the remaining review follow-ups, in this order, one plan at a time, each waiting for Albert's OK:
-  3. F3: `lock_timeout` and `idle_in_transaction_session_timeout` on `relay_db` connections, including how the API answers a lock timeout and what the worker does with one.
+- **Done since:** review follow-up 3, F3 (plan approved by Albert first): Relay connections carry a lock timeout and an idle-in-transaction timeout (D40); the API answers a lock timeout with `503` (DESIGN §1 #26); a worker abandons its lease. The full suite passes (304 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit.
+- **Next:** the last review follow-up, waiting for Albert's OK on its plan:
   4. F4(b): target connection failures do not count toward `MAX_ATTEMPTS`. D9 stays as it is.
   Then M5 (idempotency keys), which also needs a plan and Albert's OK first.
 - **Opus backlog (review findings left for later; see REVIEW.md):**
@@ -235,6 +235,41 @@ Status values: `not started`, `in progress`, `done`.
 - Notes:
   - Decision D39 added; D8 points to it; DESIGN §4.3 gained "Retry-limit probe", §5 and §8 updated. README's retry-limit bullet extended.
   - Behavior change visible to users: a different-hash marker at the limit now has its own error text; the check can take up to `LOCK_TIMEOUT`.
+
+### 3. F3: timeouts on Relay connections
+
+- Status: in progress (all checks pass; waiting on Albert's review)
+- Started: 2026-11-16 / Finished:
+- Scope: `relay/db.py::connect_relay` (session `lock_timeout` and `idle_in_transaction_session_timeout`, sent as startup options); settings `RELAY_LOCK_TIMEOUT` (5s) and `RELAY_IDLE_TIMEOUT` (10s); `relay/api.py` answers `LockNotAvailable` with `503` + `Retry-After: 1`; `relay/worker.py::run_once` turns a Relay-side lock timeout after the claim into `abandoned`. Albert's choices: `503` (recorded as DESIGN §1 #26) and abandon the lease. Albert's addition: prove the idle timeout never hits a healthy worker.
+- Checks:
+  - [x] `tests/test_relay_timeouts.py` (17 tests: settings in force; autocommit; bad values refused, 6 cases; environment; frozen reclaimer; frozen claimer; draft save and `SUCCEEDED` write timing out; API `503`; three "healthy worker" tests with a 300 ms idle timeout against 1 s of LLM time, target time, and poll wait)
+  - [x] Autocommit confirmed: `connect_relay` calls the same `connect` (always `autocommit=True`); the test asserts it and that a plain read leaves the session idle, not in a transaction. On the execute path the worker's only Relay statement before the final write is the lease re-check, a plain autocommit read.
+  - [x] `scripts/break_guards.py`: new mutation `relay-session-timeouts`
+  - [x] `probes/`: the two F3 probes removed; only `measure_` probes remain (10 collected)
+- Last test run (PowerShell):
+  - Red run 1 (nothing implemented): `docker compose run --rm tests pytest tests/test_relay_timeouts.py -q -p no:cacheprovider` -> `17 failed` (the settings and `connect_relay` did not exist).
+  - Red run 2 (settings in force; no API handler, no worker catch): same command -> `3 failed, 14 passed`: the draft-save, `SUCCEEDED`-write, and API tests, each with a raw `psycopg.errors.LockNotAvailable: canceling statement due to lock timeout`.
+  - After the change: same command -> `17 passed`.
+  - `docker compose run --rm tests pytest -q -p no:cacheprovider` -> `304 passed, 1 warning`.
+  - First mutation run HUNG and was stopped by hand. Cause: a bug in the new API test, not in Relay. The test sent its approve from the thread that also held the blocking transaction, so with the lock timeout removed nothing could ever release the lock. Fix: the approve now runs in a `Background` thread, whose join fails after 10 s. `break_guards.py`'s own 240 s limit did not end the run either (see Notes).
+  - After that fix: `docker compose run --rm tests pytest tests/test_relay_timeouts.py -q -p no:cacheprovider` -> `17 passed`; `python scripts/break_guards.py --only relay-session-timeouts --repeat 3` (host) -> `CAUGHT` in 3 runs of 3, all 4 expected tests failed.
+  - Repeat loop over relay timeouts, reclaim races, stale worker, concurrent approval, approve/reject -> `64 passed` 20 times out of 20.
+  - `docker compose run --rm tests pytest -q -p no:cacheprovider` (again, after the test fix) -> `304 passed, 1 warning`.
+  - `docker compose run --rm tests python -m pytest probes -q -p no:cacheprovider` -> `10 passed`.
+  - `docker compose run --rm tests python -m scripts.demo_crash` -> exit 0, final state `SUCCEEDED`.
+- Not yet tested:
+  - `run_forever` after the server ends a frozen worker's session (expected: the next statement fails and the loop reconnects). `run_forever` is still untested as a whole; the error may arrive as a non-`OperationalError` first, in which case the catch-all logs it and the following pass reconnects.
+  - The API request that was itself frozen and then wakes (expected: `500`, its transaction already rolled back). Only the request waiting behind it is tested.
+  - A lock timeout inside the claim or the reclaim sweep. Both use `SKIP LOCKED` and should never wait; if one did, `run_once` would raise.
+  - A lock timeout on a worker's `FAILED` write and at the retry limit (same `except` as the two tested writes).
+  - `503` on reject (same handler as approve), and over real HTTP.
+  - The live stack was not restarted with the new settings (`docker compose up -d --build` not run).
+- Notes:
+  - Decision D40 and spec resolution §1 #26 added; DESIGN conventions, §5, §7.6, §8 updated; README gained one bullet.
+  - For M5: the same-key wait is also subject to `RELAY_LOCK_TIMEOUT` (noted in DESIGN §8).
+  - Three of the new tests each take 1 s of real time by design, and the two frozen-holder tests about 1 s each.
+  - **`break_guards.py` weakness found, not fixed:** on this Windows host its per-run time limit did not stop a hung test run (the container was still up after 11 minutes against a 240 s limit), so the `HUNG` verdict never appeared and the script had to be stopped by hand; its temporary checkout and container were then removed by hand. Likely cause (not confirmed): after the timeout, Python waits for the output pipes, which the `docker` child processes still hold. Open question for Albert: fix it now or add it to the Opus backlog.
+  - The full suite was run once more on its own at the end -> `304 passed, 1 warning`.
 
 ## M5: Idempotency keys
 

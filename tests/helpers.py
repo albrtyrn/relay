@@ -185,6 +185,18 @@ def wait_until_a_migrator_session_is_blocked(target) -> None:
     raise AssertionError("no relay_migrator session ever blocked on a lock")
 
 
+def wait_until_session_is_gone(conn, pid: int) -> None:
+    """Return once the Postgres session `pid` no longer exists (the server ended it); fail
+    after THREAD_TIMEOUT. `conn` is any other connection to the same server."""
+    deadline = time.monotonic() + THREAD_TIMEOUT
+    while time.monotonic() < deadline:
+        row = conn.execute("SELECT count(*) AS n FROM pg_stat_activity WHERE pid = %s", (pid,)).fetchone()
+        if row["n"] == 0:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"session {pid} was never ended by the server")
+
+
 def use_up_attempts(conn, migration_id, attempts: int) -> None:
     """Test setup: make a queued job look as if it had already been claimed `attempts` times
     in this phase, without running those attempts. Touches only `attempts`, never `status`.

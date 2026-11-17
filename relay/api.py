@@ -94,8 +94,9 @@ class MigrationDetailOut(MigrationOut):
 
 
 def get_conn(request: Request) -> Iterator[psycopg.Connection]:
-    """One connection per request, closed afterwards. No pool (decision D16)."""
-    conn = db.connect(request.app.state.settings.relay_db_dsn)
+    """One connection per request, closed afterwards. No pool (decision D16). Opened with
+    the Relay session timeouts (decision D40)."""
+    conn = db.connect_relay(request.app.state.settings)
     try:
         yield conn
     finally:
@@ -106,6 +107,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the app. Tests pass Settings pointing at relay_test; uvicorn calls this with none."""
     app = FastAPI(title="Relay")
     app.state.settings = settings if settings is not None else load_settings()
+
+    @app.exception_handler(psycopg.errors.LockNotAvailable)
+    def row_is_busy(_request: Request, _error: psycopg.errors.LockNotAvailable):
+        """503 when a statement waited longer than RELAY_LOCK_TIMEOUT for a row lock
+        (decision D40; DESIGN.md section 1 #26).
+
+        This happens when another request on the same migration has changed the row and not
+        yet committed (or its process froze before committing). By the time this runs, the
+        handler's `with conn.transaction():` block has already rolled back, so this request
+        changed nothing. Not 409: the other request has not committed and may still roll
+        back, so "someone else decided" is not known. 503 with Retry-After says what is
+        known: busy, nothing happened, try again. The driver's error text is not returned.
+        """
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "migration is busy: another request is changing it; nothing was changed, retry"},
+            headers={"Retry-After": "1"},
+        )
 
     @app.get("/health")
     def health(request: Request):
@@ -150,6 +169,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     decision_responses = {
         404: {"description": "Unknown migration id"},
         409: {"description": "Not WAITING_FOR_APPROVAL, or sql_hash is not the current proposal's"},
+        503: {"description": "Another request is changing this migration; nothing was changed. Retry (see Retry-After)"},
     }
 
     @app.post("/migrations/{migration_id}/approve", response_model=MigrationOut, responses=decision_responses)

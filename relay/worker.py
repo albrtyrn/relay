@@ -58,8 +58,10 @@ class Worker:
         self.settings = settings
         self.llm = llm
         self.worker_id = worker_id or settings.worker_id
-        # One long-lived autocommit connection. No transaction is open between steps.
-        self.conn = db.connect(settings.relay_db_dsn)
+        # One long-lived autocommit connection. No transaction is open between steps, which
+        # is also why its idle-in-transaction timeout (decision D40) never fires during slow
+        # work: that timeout only counts time spent INSIDE an open transaction.
+        self.conn = db.connect_relay(settings)
         self._stop = threading.Event()
 
     def close(self) -> None:
@@ -77,13 +79,25 @@ class Worker:
         # The claim is committed. From here on this worker holds no transaction and no lock.
         hooks.fire("claim.after_commit")
 
-        if claim.attempts > self.settings.max_attempts:
-            # This job has used up its tries in this phase (decision D8). The check is made
-            # by the worker that just claimed it, so its final write has a valid token.
-            return self._exhausted(claim)
-        if claim.status == "DRAFTING":
-            return self._draft(claim)
-        return self._execute(claim)
+        try:
+            if claim.attempts > self.settings.max_attempts:
+                # This job has used up its tries in this phase (decision D8). The check is made
+                # by the worker that just claimed it, so its final write has a valid token.
+                return self._exhausted(claim)
+            if claim.status == "DRAFTING":
+                return self._draft(claim)
+            return self._execute(claim)
+        except psycopg.errors.LockNotAvailable as error:
+            # One of my writes to Relay waited longer than RELAY_LOCK_TIMEOUT for the row
+            # (decision D40): someone holds it in a transaction that has not finished, for
+            # example a reclaim of this very job. The write and its audit event were rolled
+            # back together, so nothing was changed. Treat it like every temporary problem:
+            # write nothing more and let the lease expire (decision D7). The next attempt
+            # redoes a draft, or finds the marker if the target had already committed.
+            # (A lock timeout on the TARGET never arrives here: _execute and _exhausted
+            # handle those themselves.)
+            log.warning("job %s: a Relay write timed out waiting for the row, abandoning the lease: %s", claim.id, error)
+            return ABANDONED
 
     # ---------- draft path (PENDING jobs) ----------
 
@@ -316,7 +330,7 @@ class Worker:
         while not self._stop.is_set():
             try:
                 self.conn.close()
-                self.conn = db.connect(self.settings.relay_db_dsn)
+                self.conn = db.connect_relay(self.settings)
                 return
             except psycopg.OperationalError:
                 self._stop.wait(delay)

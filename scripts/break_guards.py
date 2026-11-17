@@ -259,6 +259,21 @@ MUTATIONS = [
         expected=(E + "test_sql_not_matching_approved_hash_fails_without_touching_target",),
     ),
     Mutation(
+        name="relay-session-timeouts",
+        guard="the lock and idle-in-transaction timeouts on Relay connections (connect_relay sends no options)",
+        invariant="2, for a process that freezes inside a Relay transaction (decision D40)",
+        file="relay/db.py",
+        pattern=r"return connect\(settings\.relay_db_dsn, options=options\)",
+        replacement="return connect(settings.relay_db_dsn)  # MUTANT: no session timeouts",
+        # The frozen-holder tests fail when their 10-second waits run out, not instantly.
+        expected=(
+            "tests/test_relay_timeouts.py::test_relay_connections_carry_both_timeouts_and_plain_connections_do_not",
+            "tests/test_relay_timeouts.py::test_frozen_reclaimer_is_ended_by_the_server_and_the_blocked_owner_proceeds",
+            "tests/test_relay_timeouts.py::test_frozen_claimer_is_ended_by_the_server_and_the_job_becomes_claimable_again",
+            "tests/test_relay_timeouts.py::test_approve_that_times_out_on_a_row_lock_gets_503_retry_after_and_changes_nothing",
+        ),
+    ),
+    Mutation(
         name="approve-hash-binding",
         guard="the API's check that the reviewer's sql_hash is the stored proposal's hash",
         invariant="PLAN mechanism 2",

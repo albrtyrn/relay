@@ -8,6 +8,7 @@ Conventions used everywhere below:
 
 - **Autocommit connections, explicit transactions.** Every psycopg connection is opened with `autocommit=True`, and every transaction is a visible `with conn.transaction():` block. Outside such a block, no transaction is open. (psycopg's default silently opens a transaction on the first statement and keeps it open, which would break invariant 2 during an LLM call.)
 - **Isolation level:** READ COMMITTED, the Postgres default, and pinned explicitly in `db.connect` (`conn.isolation_level`), so every `with conn.transaction():` block begins at that level whatever the server default is. The compare-and-set logic depends on it (§4.1, D27).
+- **Relay session timeouts (D40):** the API and the workers open `relay_db` connections with `db.connect_relay`, which sets `lock_timeout` (`RELAY_LOCK_TIMEOUT`, 5 s) and `idle_in_transaction_session_timeout` (`RELAY_IDLE_TIMEOUT`, 10 s) for the whole session. A process that freezes inside a Relay transaction is ended by the server; a statement that waits too long for a row gets an error (API: `503`; worker: abandon the lease). The idle timeout counts only time inside an open transaction, so with autocommit connections it never touches a worker waiting on the LLM, the target, or the next poll.
 - **Time:** every lease comparison uses the Postgres clock (`now()`), never a worker's clock.
 - **Hash:** `sha256(sql.encode("utf-8")).hexdigest()` over the exact stored text. No whitespace or case normalization.
 - **Actors** in the audit log: `user:<X-User>`, `worker:<worker_id>`, `reclaimer:<worker_id>`.
@@ -16,7 +17,7 @@ Conventions used everywhere below:
 
 ## 1. Spec issues
 
-**Status: all 25 resolutions accepted (Albert, 2026-11-16).** They are now part of the spec.
+**Status: all 25 resolutions accepted (Albert, 2026-11-16).** They are now part of the spec. #26 was added and accepted the same day, with review follow-up 3.
 
 | # | Issue in PLAN.md | Resolution (accepted) |
 | --- | --- | --- |
@@ -45,6 +46,7 @@ Conventions used everywhere below:
 | 23 | **Compose only creates `relay_db`.** PLAN wants `target_db` in the same container. | A `dbinit` step creates databases, the role, and the schema (§2, §3). |
 | 24 | **Code vs. docs:** README hard-codes `psql -U relay`, but the user comes from `.env`. | Fix the README line at M1. |
 | 25 | **Python version.** PLAN says "e.g. `python:3.13-slim`"; CLAUDE.md's approved stack says Python 3.12. | Python 3.12 (`python:3.12-slim`, exact tag pinned at M1). pglast 8.8 ships `cp312` manylinux wheels for both x86_64 and aarch64 (checked on PyPI, 2026-11-16). PLAN's line is an example, not a requirement; update it when PLAN is next edited. |
+| 26 | **Status code for "the row is busy"** (added 2026-11-16, accepted by Albert with review follow-up 3). PLAN's status list is `200`, `202`, `404`, `409`, `422`, `500`. With a `lock_timeout` on Relay connections (D40), an approve or reject can now give up waiting for a row that another request has changed but not committed; none of those codes says that. | `503` with `Retry-After: 1` and a plain message. The request changed nothing. Not `409`: the other request has not committed and may roll back, so "someone else decided" is not yet true. Not `500`: nothing unexpected happened. `503` is added to the list for approve and reject (`/health` already uses it, #19). |
 
 ---
 
@@ -72,7 +74,7 @@ relay/
 ├── relay/                  the Python package
 │   ├── __init__.py
 │   ├── config.py           reads env vars once into a frozen Settings dataclass
-│   ├── db.py               connect helpers (autocommit on) for relay_db and target_db
+│   ├── db.py               connect helpers (autocommit on): `connect_relay` with session timeouts (D40), plain `connect` for the target and tools
 │   ├── dbinit.py           `python -m relay.dbinit`: create databases and role, revoke CONNECT on the Relay database, apply schemas; `--reset` drops first
 │   ├── sqlhash.py          the one sha256 function
 │   ├── transitions.py      [core] transition helper and the table of legal (from, to) pairs
@@ -599,7 +601,8 @@ exhausted(claim):                               # retry limit reached
 | `DDLFailed`, including `lock_timeout` / `statement_timeout` on the DDL | `EXECUTING → FAILED`, `error` saved |
 | `HASH_MISMATCH` on an existing marker | `EXECUTING → FAILED` |
 | Marker-step error, target connection lost, commit outcome unknown | Retry: abandon the lease |
-| Relay connection lost | Reconnect with backoff; the lease covers the gap |
+| Relay connection lost (including: the server ended a session that froze inside a transaction, D40) | Reconnect with backoff; the lease covers the gap |
+| A Relay write waits longer than `RELAY_LOCK_TIMEOUT` for the row (D40) | Retry: abandon the lease. Nothing was written; a draft is redone, and after a target commit the next attempt finds the marker |
 | Any worker write returns 0 rows | Stop this job, no further writes; it belongs to someone else now |
 | Unexpected exception (a bug) | Log it, abandon the lease; the limit stops a crash loop |
 | `attempts > MAX_ATTEMPTS` on claim | `exhausted()` above |
@@ -721,9 +724,11 @@ Crash tests: `helpers.spawn_worker(hook="execute.after_target_commit:crash")` st
 
 ### 7.6 Configuration (all from environment; `.env.example` lists each)
 
-`RELAY_DB_DSN`, `TARGET_DB_DSN` (as `relay_migrator`), `ADMIN_DSN` (dbinit and tests only), `TARGET_MIGRATOR_PASSWORD`, `WORKER_ID` (default hostname + pid), `LEASE_SECONDS=60`, `POLL_SECONDS=1`, `MAX_ATTEMPTS=5`, `LOCK_TIMEOUT=5s`, `STATEMENT_TIMEOUT=15s`, `TARGET_IDLE_TIMEOUT=30s`, `LLM_PROVIDER=fake`, `LLM_TIMEOUT_SECONDS=20`, `RELAY_HOOK` (unset outside tests and the demo).
+`RELAY_DB_DSN`, `TARGET_DB_DSN` (as `relay_migrator`), `ADMIN_DSN` (dbinit and tests only), `TARGET_MIGRATOR_PASSWORD`, `WORKER_ID` (default hostname + pid), `LEASE_SECONDS=60`, `POLL_SECONDS=1`, `MAX_ATTEMPTS=5`, `LOCK_TIMEOUT=5s`, `STATEMENT_TIMEOUT=15s`, `TARGET_IDLE_TIMEOUT=30s`, `RELAY_LOCK_TIMEOUT=5s`, `RELAY_IDLE_TIMEOUT=10s` (D40), `LLM_PROVIDER=fake`, `LLM_TIMEOUT_SECONDS=20`, `RELAY_HOOK` (unset outside tests and the demo).
 
-The three timeouts are written as a whole number followed by `ms`, `s`, or `min`. Relay accepts only that subset of Postgres's spellings so the startup check can read them the way Postgres will. **Startup rule (D33):** `LEASE_SECONDS > LOCK_TIMEOUT + STATEMENT_TIMEOUT + 10 s`, and neither timeout may be zero (zero disables it in Postgres). A worker that breaks the rule refuses to start.
+The two `RELAY_*` timeouts use the same format, are checked by `db.connect_relay`, and may not be zero. They have defaults and are not in `.env.example` (D24).
+
+The three target timeouts are written as a whole number followed by `ms`, `s`, or `min`. Relay accepts only that subset of Postgres's spellings so the startup check can read them the way Postgres will. **Startup rule (D33):** `LEASE_SECONDS > LOCK_TIMEOUT + STATEMENT_TIMEOUT + 10 s`, and neither timeout may be zero (zero disables it in Postgres). A worker that breaks the rule refuses to start.
 
 ### 7.7 Dependencies
 
@@ -887,6 +892,22 @@ No production code changed. These came from the review's probes (REVIEW.md §5 a
 - `test_retry_limit.py::test_execution_at_limit_with_a_different_hash_marker_fails_and_says_so`
 - `test_retry_limit.py::test_execution_at_limit_without_marker_fails` (existing; now also the test that the probe's own insert is rolled back)
 
+### Review follow-up 3: timeouts on Relay connections (F3, D40; 2026-11-16)
+
+`db.connect_relay`, two settings, a `503` handler in `api.py`, one `except` in `worker.py::run_once`. All in `test_relay_timeouts.py`:
+
+- `test_relay_connections_carry_both_timeouts_and_plain_connections_do_not`
+- `test_relay_connections_are_autocommit_so_a_plain_read_leaves_no_transaction_open`
+- `test_zero_or_malformed_relay_timeout_is_refused` (6 cases), `test_relay_timeouts_are_read_from_the_environment`
+- `test_frozen_reclaimer_is_ended_by_the_server_and_the_blocked_owner_proceeds` (F3 sequence A; the owner is seen blocked)
+- `test_frozen_claimer_is_ended_by_the_server_and_the_job_becomes_claimable_again` (F3 sequence C)
+- `test_draft_save_that_times_out_on_a_row_lock_abandons_and_the_retry_saves`
+- `test_succeeded_write_that_times_out_on_a_row_lock_abandons_and_the_next_worker_finds_the_marker`
+- `test_approve_that_times_out_on_a_row_lock_gets_503_retry_after_and_changes_nothing` (§1 #26; F3 sequence B from the waiter's side)
+- A healthy worker is never hit (300 ms idle timeout against 1 s of slow work): `test_llm_call_longer_than_the_idle_timeout_does_not_cost_the_worker_its_connection`, `test_target_work_longer_than_the_idle_timeout_does_not_cost_the_worker_its_connection`, `test_worker_idle_between_passes_longer_than_the_idle_timeout_keeps_its_connection`
+
+**For M5:** the same-key wait on the `idempotency_keys` unique index is also subject to `RELAY_LOCK_TIMEOUT`. The `503` is raised as an exception, so the key rolls back with everything else and a retry with the same key runs fresh (consistent with D19). M5's plan must test that.
+
 ### M5: Idempotency keys
 
 `idempotency_keys` table, `idempotency.py` [core], header required on approve and reject.
@@ -954,6 +975,7 @@ No production code changed. These came from the review's probes (REVIEW.md §5 a
 | D37 | **Added at M4.** `run_once()` gains the outcome `succeeded`, and `lost` also covers "my lease had too little time left to begin target work" (extends D31) | Reuse `saved` for a finished execution; a separate `expired` outcome | Tests and the demo need to tell a draft saved from a migration applied. In both `lost` cases the worker does the same thing: stop and write nothing. |
 | D38 | **Accepted 2026-11-16 (review follow-up 1).** A connection lost during the target `COMMIT` is tested with a TCP relay written in the test file with standard-library sockets (`CommitCuttingProxy`), which cuts the connection when it sees the `COMMIT` message, in two modes: after the server processed it, or before it arrived | `pg_terminate_backend` from a hook (what `test_lost_target_connection_does_not_mark_failed` uses); an external fault-injection proxy such as Toxiproxy; a fake connection object | Killing the session cannot be aimed at the instant between "`COMMIT` sent" and "answer received", and that instant is the only place where the outcome is truly unknown. An external proxy is a new dependency and a new Compose service for about 60 lines of sockets. A fake connection would break invariant 5: the point is what real Postgres does with a half-finished commit. Cost: the proxy finds `COMMIT` by its bytes in one network read, which relies on how psycopg ends a transaction block; each test asserts the cut happened, so a change there fails loudly. |
 | D39 | **Accepted 2026-11-16 (review follow-up 2, finding F1).** At the execution retry limit the worker asks the target with `probe_marker`: the same marker `INSERT` as the normal path, inside a target transaction that is rolled back if the insert succeeded. Results: `ALREADY_APPLIED` → `SUCCEEDED`; `NOT_APPLIED` → `FAILED` "retry limit reached"; `HASH_MISMATCH` → `FAILED` "retry limit reached; target marker exists with a different hash"; any target error → no write, lease abandoned. The marker `INSERT` is written once (`_insert_marker`) and shared with `apply_on_target`. | A plain `SELECT` of the marker (D8 as first built); commit a "tombstone" marker with a fake hash so later stale attempts are refused; `LOCK TABLE relay_applied` then `SELECT`; only widen the README non-guarantee; keep the bare "retry limit reached" for a hash mismatch | The `SELECT` does not wait for an attempt that is inside its target transaction, so Relay could say `FAILED` for a migration that then committed (reproduced in the review). A tombstone would close more of the late-apply gap but changes what a marker means ("this was applied"); that is fencing and belongs with D23. `relay_migrator` has only `SELECT` and `INSERT` on the table, and the lock modes those allow do not conflict with another session's insert. A marker with a different hash is an anomaly a person should see, so the message names it. Cost: the check can now wait up to `LOCK_TIMEOUT`, and a job over the limit whose earlier attempt is stuck costs one lease per retry until the target's idle timeout ends that attempt. **Still open:** an attempt that *starts* after the probe (D23). Tested in `test_retry_limit.py`; mutation `probe-rollback`. |
+| D40 | **Accepted 2026-11-16 (review follow-up 3, finding F3).** Relay's own connections (API requests, workers) are opened with `db.connect_relay`, which sets `lock_timeout` (`RELAY_LOCK_TIMEOUT`, default 5 s) and `idle_in_transaction_session_timeout` (`RELAY_IDLE_TIMEOUT`, default 10 s) for the session, sent as connection startup options after a format check (zero refused). A lock timeout in the API becomes `503` + `Retry-After: 1` through one exception handler (§1 #26). A lock timeout on a worker's write after its claim ends the pass as `abandoned` (one `except` in `run_once`). A session the server ended is handled by the existing reconnect path. Plain `db.connect` (target, `dbinit`, `/health`, tests) is unchanged. | No timeouts (as built through M4); `set_config(..., true)` in every Relay transaction, as the target does; `ALTER DATABASE ... SET`; two `SET` statements after connecting; `409` for the API; retrying the worker's write in place; also a `statement_timeout`; a startup rule tying `RELAY_LOCK_TIMEOUT` to the lease | Invariant 2 covered planned slow work only: a process frozen inside a short transaction held its row lock for as long as its connection lived, blocked the owner's save or every later decision on that migration, and could leave a `PENDING` row locked with no lease to expire (reproduced in the review). Per-transaction settings mean many call sites and one forgotten is silent; a database-wide setting also hits tests and admin sessions and lives outside the code; `SET` after connect costs two round trips per API request (one connection per request, D16). `409` would claim a decision that has not committed. A second retry mechanism contradicts D7. Relay statements touch one row, so a `statement_timeout` adds little; it can be added the same way. D6 makes a late final write safe, so no lease rule is needed (the write can now wait up to 5 s, inside D33's 10 s margin). **Why it cannot hit healthy code:** the idle timeout counts only time inside an open transaction, and every connection is autocommit (D1); three tests run slow work past a 300 ms idle timeout. Cost: under heavy contention on one migration a request can get `503` where it used to wait. |
 
 ---
 
