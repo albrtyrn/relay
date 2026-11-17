@@ -167,8 +167,7 @@ class Worker:
         try:
             target_conn = db.connect(self.settings.target_db_dsn)
         except psycopg.Error as error:
-            log.warning("job %s: cannot reach the target, abandoning the lease: %s", claim.id, error)
-            return ABANDONED
+            return self._target_unreachable(claim, error)
         try:
             # Last look before touching the target. If my lease does not have enough time
             # left to cover the whole target transaction, another worker could take this job
@@ -200,6 +199,44 @@ class Worker:
             return self._fail(claim, "target marker exists with a different hash")
         # APPLIED (I ran the DDL) or ALREADY_APPLIED (an earlier attempt did): both are success.
         return self._succeed(claim)
+
+    def _target_unreachable(self, claim: Claim, error: psycopg.Error) -> str:
+        """The target connection could not be OPENED, so nothing was tried there. Give this
+        claim's attempt back and keep the lease (decision D41).
+
+        Why: `attempts` went up when this job was claimed, and the retry limit (D8) fails a
+        job claimed too often. Without the refund, an outage longer than MAX_ATTEMPTS leases
+        would mark every approved job FAILED although its SQL never ran once.
+
+        The write: one transition EXECUTING -> EXECUTING through the helper, setting
+        attempts back by one, guarded by my lease token, with its audit event. If it matches
+        0 rows the job is no longer mine, and the new owner's count is left alone.
+
+        The lease is NOT released: the job stays out of the queue until the lease expires,
+        which is the pause between retries (decision D7) and lets other jobs go first.
+
+        Because such a pass is never counted, a target that stays unreachable (a wrong
+        password, say) is retried once per lease without end. So this logs at ERROR, with
+        the driver's reason, every time: a misconfiguration must be loud. The SQLSTATE is
+        included when there is one; for a failed connection psycopg reports none, and the
+        text carries the reason (for example "password authentication failed").
+
+        Only this case is refunded. Once the connection is open, a failure counts as an
+        attempt, because target work was started or its outcome is unknown.
+        """
+        log.error(
+            "job %s: cannot connect to the target (SQLSTATE %s): %s; "
+            "attempt not counted, will retry when the lease expires",
+            claim.id, error.sqlstate or "not reported", str(error).strip(),
+        )
+        with self.conn.transaction():
+            refunded = transition(
+                self.conn, claim.id, "EXECUTING", "EXECUTING", f"worker:{self.worker_id}",
+                lease_token=claim.lease_token,
+                detail="target unreachable; attempt not counted",
+                set_fields={"attempts": claim.attempts - 1},
+            )
+        return ABANDONED if refunded else self._lost(claim)
 
     def _lease_covers_target_work(self, claim: Claim) -> bool:
         """One plain read, no lock: is this EXECUTING job still mine, with MORE lease time
@@ -268,7 +305,9 @@ class Worker:
         except psycopg.Error as error:
             # No verdict: the target is unreachable, or the probe timed out waiting for an
             # attempt that is still in flight. Never FAILED on an unknown outcome; the next
-            # claim (still over the limit) probes again.
+            # claim (still over the limit) probes again. No refund here (unlike
+            # _target_unreachable): this job is over the limit through attempts that did
+            # reach the target, and one more or less changes nothing.
             log.warning("job %s: no verdict from the marker probe, abandoning the lease: %s", claim.id, error)
             return ABANDONED
         if verdict == ALREADY_APPLIED:

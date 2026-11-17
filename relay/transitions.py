@@ -29,9 +29,15 @@ LEGAL_TRANSITIONS = frozenset({
     ("EXECUTING", "SUCCEEDED"),                # the migration is applied
     ("EXECUTING", "FAILED"),                   # the migration failed for good
     ("EXECUTING", "APPROVED"),                 # lease expired: back to the queue
+    # The one edge that keeps the status. A worker that could not even connect to the
+    # target gives its attempt back (set_fields = {attempts: one less}) and keeps its lease
+    # (decision D41). It is in this table, and not a separate UPDATE elsewhere, so that it
+    # gets the same lease-token check and the same audit event as every other worker write.
+    ("EXECUTING", "EXECUTING"),
 })
 
-# States in which a worker owns the row. Leaving one always requires a lease token.
+# States in which a worker owns the row. A transition FROM one always requires a lease token
+# (that includes the same-state edge above).
 LEASED_STATUSES = frozenset({"DRAFTING", "EXECUTING"})
 
 # The only columns a caller may set alongside the status. `status` itself is not here, so it

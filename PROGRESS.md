@@ -14,9 +14,8 @@ Status values: `not started`, `in progress`, `done`.
 - **Done since:** review follow-up 1 (plan approved by Albert first): 13 probes became tests; no file in `relay/` changed; the full suite passes (283 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit.
 - **Done since:** review follow-up 2, F1 (plan approved by Albert first): the retry-limit check is now a waiting probe (D39); the full suite passes (287 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit.
 - **Done since:** review follow-up 3, F3 (plan approved by Albert first): Relay connections carry a lock timeout and an idle-in-transaction timeout (D40); the API answers a lock timeout with `503` (DESIGN §1 #26); a worker abandons its lease. The full suite passes (304 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit.
-- **Next:** the last review follow-up, waiting for Albert's OK on its plan:
-  4. F4(b): target connection failures do not count toward `MAX_ATTEMPTS`. D9 stays as it is.
-  Then M5 (idempotency keys), which also needs a plan and Albert's OK first.
+- **Done since:** review follow-up 4, F4(b) (plan approved by Albert first): a pass that cannot connect to the target gives its attempt back (D41). The full suite passes (312 tests). Details in "Review follow-ups" below. Waits for Albert's review and commit. **All four review follow-ups are now built.**
+- **Next:** M5 (idempotency keys). It touches transactions, so it needs a plan and Albert's OK first. The plan must cover the same-key wait under `RELAY_LOCK_TIMEOUT` (D40; DESIGN §8 note).
 - **Opus backlog (review findings left for later; see REVIEW.md):**
   - F5: no network-level timeout on the target connection (a silently dead network can hang a worker).
   - F6: `test_lost_target_connection_does_not_mark_failed` kills every `relay_migrator` session on the server; crash tests can leak a worker process.
@@ -24,6 +23,7 @@ Status values: `not started`, `in progress`, `done`.
   - F8: no test enforces "only the helper writes `status`".
   - F9: the README's lost-connection sentence was ahead of its test. Follow-up 1 added the test (`test_commit_cut.py`) and the README now cites it; nothing left unless the wording should change.
   - F10: `GET /migrations/{id}` reads the row and its events in two statements.
+  - `scripts/break_guards.py`: on this Windows host its per-run time limit does not stop a hung test run, so the `HUNG` verdict never appears and the script must be stopped by hand (seen in follow-up 3: a container still up after 11 minutes against a 240 s limit). Likely cause, not confirmed: after the timeout Python waits for output pipes that the `docker` child processes still hold. After stopping it by hand, remove the leftover container (`docker rm -f relay-break-guards-...`) and checkout (`git worktree remove --force <path>`; `git worktree prune`).
 - **Answered (Albert, 2026-11-16):**
   - Keep D16: one connection per request, no `psycopg_pool`.
   - No `pytest-repeat`. Repeat race tests with a shell loop (DESIGN §7.1 and §7.7 updated).
@@ -268,8 +268,37 @@ Status values: `not started`, `in progress`, `done`.
   - Decision D40 and spec resolution §1 #26 added; DESIGN conventions, §5, §7.6, §8 updated; README gained one bullet.
   - For M5: the same-key wait is also subject to `RELAY_LOCK_TIMEOUT` (noted in DESIGN §8).
   - Three of the new tests each take 1 s of real time by design, and the two frozen-holder tests about 1 s each.
-  - **`break_guards.py` weakness found, not fixed:** on this Windows host its per-run time limit did not stop a hung test run (the container was still up after 11 minutes against a 240 s limit), so the `HUNG` verdict never appeared and the script had to be stopped by hand; its temporary checkout and container were then removed by hand. Likely cause (not confirmed): after the timeout, Python waits for the output pipes, which the `docker` child processes still hold. Open question for Albert: fix it now or add it to the Opus backlog.
+  - **`break_guards.py` weakness found, not fixed:** its per-run time limit did not stop the hung run. Albert put it on the Opus backlog (see the list at the top).
   - The full suite was run once more on its own at the end -> `304 passed, 1 warning`.
+
+### 4. F4(b): an unreachable target does not use up the retry limit
+
+- Status: in progress (all checks pass; waiting on Albert's review)
+- Started: 2026-11-16 / Finished:
+- Scope: `relay/transitions.py` gains the legal pair `EXECUTING → EXECUTING` (eleven pairs now); `relay/worker.py::_target_unreachable` gives the attempt back through it (own token, `attempts - 1`, audit detail "target unreachable; attempt not counted"), keeps the lease, and logs at ERROR. Albert's choices: the same-state transition through the helper; unbounded retries accepted for v1 and listed in the README non-guarantees; each refunded pass logs at ERROR. D9 unchanged.
+- Checks:
+  - [x] `tests/test_target_unreachable.py` (6 tests: refund and kept lease; outage longer than the limit then `SUCCEEDED`; real attempts still count; stale worker's refund matches 0 rows; at the limit no refund; the ERROR log line)
+  - [x] `tests/test_transitions.py`: new same-state test; legal-table test now expects eleven pairs (renamed); `DRAFTING → DRAFTING` added to the illegal pairs
+  - [x] `scripts/break_guards.py`: new mutation `unreachable-refund`; no existing pattern changed
+- **Differs from what Albert asked, in one detail:** the log line was to carry the connection error's SQLSTATE (for example `28P01`). psycopg reports no SQLSTATE for a failed connection: a scratch check of bad password, connection refused, missing database, and unknown host gave `sqlstate=None` for all four (psycopg 3.3.9). The line therefore carries the driver's text (for example `password authentication failed for user "relay_migrator"`) and prints the SQLSTATE only when one exists (`SQLSTATE not reported` otherwise). The test asserts the ERROR level, the job id, "attempt not counted", and "password authentication failed". Say so if you want the code derived from the text instead.
+- Last test run (PowerShell):
+  - Red run first: `docker compose run --rm tests pytest tests/test_target_unreachable.py tests/test_transitions.py -q -p no:cacheprovider` -> `7 failed, 30 passed`: attempts stayed at 1 (`assert 1 == 0`); the stale worker ended `abandoned`, not `lost`; no ERROR records (`assert 0 == 2`); `illegal transition EXECUTING -> EXECUTING`; the legal table lacked the pair. The at-the-limit test passed already, as planned.
+  - After the change: same command -> `37 passed`.
+  - `docker compose run --rm tests pytest -q -p no:cacheprovider` -> `312 passed, 1 warning` (run twice; the second time alone, last).
+  - `python scripts/break_guards.py --only unreachable-refund lease-token-check status-check --repeat 3` (host) -> baseline 9 passed; all three `CAUGHT` in 3 runs of 3 (2, 3, 4 expected tests failed).
+  - Repeat loop over target unreachable, transitions, retry limit, execute, stale worker -> `63 passed` 20 times out of 20.
+  - `docker compose run --rm tests python -m scripts.demo_crash` -> exit 0, final state `SUCCEEDED`.
+- Not yet tested:
+  - The refund write itself timing out on a Relay row lock (expected: `abandoned`, attempt stays counted) and a worker dying between the failed connect and the refund (attempt stays counted).
+  - A connect that hangs until `connect_timeout` (5 s) instead of being refused at once; and a target that goes away after the connection opened is, by design, counted (covered only by the older killed-session and `COMMIT`-cut tests, which do not look at `attempts`).
+  - The log line for causes other than a wrong password (checked by hand in the scratch run only).
+  - Many approved jobs during one outage (each is claimed and refunded in turn, one lease apart).
+  - The live stack: the dev workers were created with an old target password (see the note at the top). After `docker compose up -d` without recreating them they would now log an ERROR per lease and never fail a job. Not run.
+  - The `--full` mutation run over every guard has not been repeated since the review.
+- Notes:
+  - Decision D41 added; D8 points to it; DESIGN §4.1 (legal table), §5, §8, §10 updated.
+  - README: one new "tested" bullet and two new non-guarantees. The second ("a schema change that times out is not retried") was not asked for: it states D9 as it stands, shown by `test_timeouts_fire.py`. Remove it if you would rather not.
+  - F4(a) is unchanged: one lock wait on the DDL is still a terminal `FAILED` (D9; Phase 2 backlog "Revisit D9").
 
 ## M5: Idempotency keys
 

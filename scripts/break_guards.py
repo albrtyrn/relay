@@ -259,6 +259,18 @@ MUTATIONS = [
         expected=(E + "test_sql_not_matching_approved_hash_fails_without_touching_target",),
     ),
     Mutation(
+        name="unreachable-refund",
+        guard="the attempt given back when the target connection cannot be opened (the write stays, but refunds nothing)",
+        invariant="decision D41 (an attempt counts only if the target could be reached)",
+        file="relay/worker.py",
+        pattern=r'set_fields=\{"attempts": claim\.attempts - 1\}',
+        replacement='set_fields={"attempts": claim.attempts}  # MUTANT: attempt not given back',
+        expected=(
+            "tests/test_target_unreachable.py::test_unreachable_target_gives_the_attempt_back_and_keeps_the_lease",
+            "tests/test_target_unreachable.py::test_outage_longer_than_the_retry_limit_does_not_fail_the_job",
+        ),
+    ),
+    Mutation(
         name="relay-session-timeouts",
         guard="the lock and idle-in-transaction timeouts on Relay connections (connect_relay sends no options)",
         invariant="2, for a process that freezes inside a Relay transaction (decision D40)",

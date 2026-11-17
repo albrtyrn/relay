@@ -325,6 +325,9 @@ Legal transitions and what each sets:
 | `EXECUTING` → `SUCCEEDED` | worker | own token | lease columns = `NULL` |
 | `EXECUTING` → `FAILED` | worker | own token | `error`, lease columns = `NULL` |
 | `EXECUTING` → `APPROVED` | reclaim | expired token | lease columns = `NULL` |
+| `EXECUTING` → `EXECUTING` | worker (target unreachable, D41) | own token | `attempts` = one less; the lease is kept |
+
+The last row is the only one that keeps the status. It is in the table so that giving an attempt back uses the same token check and audit event as every other worker write; it is not a general "edit the row" door (`set_fields` is still limited to the allow-list, and the worker only ever sets `attempts`).
 
 | | |
 | --- | --- |
@@ -572,7 +575,9 @@ draft(claim):                                   # acts on PENDING jobs
 
 execute(claim):                                 # acts on APPROVED jobs
       check sha256(proposed_sql) == approved_sql_hash; policy.validate(proposed_sql)
-      open the target connection; re-check the lease on Relay (D33); not mine, or too little time left -> "lost"
+      open the target connection
+          cannot open it -> R4'' transition(EXECUTING -> EXECUTING, token, attempts - 1); log ERROR; "abandoned" (D41)
+      re-check the lease on Relay (D33); not mine, or too little time left -> "lost"
   T1  apply_on_target(...)                      # target txn, §4.3; no Relay txn open
       hooks.fire("execute.after_target_commit")
   R4  transition(EXECUTING -> SUCCEEDED or FAILED, token)     # Relay txn
@@ -590,7 +595,7 @@ exhausted(claim):                               # retry limit reached
 
 `run_forever` sleeps `POLL_SECONDS` (plus a little random jitter so workers do not poll in step) when `run_once` returns `idle`, and finishes the current job before exiting on `SIGTERM`.
 
-**There is one retry mechanism: abandon the lease.** A worker that cannot finish does nothing further; the lease expires, reclaim returns the job to the queue, and `attempts` counts up to the limit.
+**There is one retry mechanism: abandon the lease.** A worker that cannot finish does nothing further; the lease expires, reclaim returns the job to the queue, and `attempts` counts up to the limit. One exception to "does nothing further": a worker that could not open the target connection first gives its attempt back (D41). It still abandons the lease; it does not release the job.
 
 | Situation | Action |
 | --- | --- |
@@ -600,7 +605,9 @@ exhausted(claim):                               # retry limit reached
 | Hash or policy check fails before execution | `EXECUTING → FAILED`, target untouched |
 | `DDLFailed`, including `lock_timeout` / `statement_timeout` on the DDL | `EXECUTING → FAILED`, `error` saved |
 | `HASH_MISMATCH` on an existing marker | `EXECUTING → FAILED` |
-| Marker-step error, target connection lost, commit outcome unknown | Retry: abandon the lease |
+| Marker-step error, target connection lost, commit outcome unknown | Retry: abandon the lease (the attempt counts) |
+| Target connection cannot be opened, job within its limit (D41) | Retry: give the attempt back (`EXECUTING → EXECUTING`, own token), keep the lease, log at ERROR with the driver's reason. Not counted toward `MAX_ATTEMPTS`, so there is no upper bound while the target stays unreachable |
+| Target connection cannot be opened, job already over its limit | Retry: abandon the lease, no refund; the probe (D39) decides once the target answers |
 | Relay connection lost (including: the server ended a session that froze inside a transaction, D40) | Reconnect with backoff; the lease covers the gap |
 | A Relay write waits longer than `RELAY_LOCK_TIMEOUT` for the row (D40) | Retry: abandon the lease. Nothing was written; a draft is redone, and after a target commit the next attempt finds the marker |
 | Any worker write returns 0 rows | Stop this job, no further writes; it belongs to someone else now |
@@ -908,6 +915,19 @@ No production code changed. These came from the review's probes (REVIEW.md §5 a
 
 **For M5:** the same-key wait on the `idempotency_keys` unique index is also subject to `RELAY_LOCK_TIMEOUT`. The `503` is raised as an exception, so the key rolls back with everything else and a retry with the same key runs fresh (consistent with D19). M5's plan must test that.
 
+### Review follow-up 4: an unreachable target does not use up the retry limit (F4(b), D41; 2026-11-16)
+
+`transitions.py` gains the pair `EXECUTING → EXECUTING`; `worker.py::_target_unreachable` uses it.
+
+- `test_target_unreachable.py::test_unreachable_target_gives_the_attempt_back_and_keeps_the_lease`
+- `test_target_unreachable.py::test_outage_longer_than_the_retry_limit_does_not_fail_the_job` (four claims against `MAX_ATTEMPTS = 2`, then `SUCCEEDED`)
+- `test_target_unreachable.py::test_attempts_that_reached_the_target_still_count_across_an_unreachable_pass`
+- `test_target_unreachable.py::test_stale_workers_refund_matches_zero_rows_and_leaves_the_new_owners_count_alone` (forced with `claim.after_commit`)
+- `test_target_unreachable.py::test_unreachable_target_at_the_retry_limit_abandons_without_a_refund` (passed before the change too)
+- `test_target_unreachable.py::test_each_refunded_pass_logs_an_error_with_the_drivers_reason` (wrong password)
+- `test_transitions.py::test_same_state_executing_transition_changes_attempts_only_and_needs_the_token`
+- `test_transitions.py::test_legal_table_is_exactly_the_eleven_designed_transitions` (renamed from "ten")
+
 ### M5: Idempotency keys
 
 `idempotency_keys` table, `idempotency.py` [core], header required on approve and reject.
@@ -942,7 +962,7 @@ No production code changed. These came from the review's probes (REVIEW.md §5 a
 | D5 | No lease renewal | Heartbeat thread extending the lease | A second thread and connection per worker for work bounded at ~40 s. Timeouts are set under the lease instead. |
 | D6 | A worker's write checks only token and status, not `lease_expires_at > now()` | Also require an unexpired lease | Until someone reclaims the row, nobody else can be working on it, so accepting the late write is safe and avoids redoing finished work. |
 | D7 | Retry = abandon the lease | A worker-initiated "release" transition | One recovery path to build, test, and explain. Cost: a transient failure waits up to `LEASE_SECONDS` before retry. |
-| D8 | **Accepted 2026-11-16.** Retry limit pulled into M3/M4, enforced by the claiming worker; execution at the limit reads the marker before deciding | Defer to Phase 2 (PLAN); or have the reclaim sweep mark `FAILED` | Without it a poison job loops forever through the whole core build. The claimer holds a lease, so the write satisfies invariant 3, and reading the marker avoids marking `FAILED` a migration that actually applied. **Changed by D39:** the "read" is now a waiting probe (marker `INSERT`, then rollback), not a plain `SELECT`. |
+| D8 | **Accepted 2026-11-16.** Retry limit pulled into M3/M4, enforced by the claiming worker; execution at the limit reads the marker before deciding | Defer to Phase 2 (PLAN); or have the reclaim sweep mark `FAILED` | Without it a poison job loops forever through the whole core build. The claimer holds a lease, so the write satisfies invariant 3, and reading the marker avoids marking `FAILED` a migration that actually applied. **Changed by D39:** the "read" is now a waiting probe (marker `INSERT`, then rollback), not a plain `SELECT`. **Changed by D41:** a claim whose pass could not connect to the target is not counted. |
 | D9 | **Accepted 2026-11-16 for v1.** DDL errors, including both timeouts, are terminal `FAILED`; unknown outcomes retry. A timeout on the marker insert is classified separately as contention and retries (§4.3) | Retry `lock_timeout` automatically | Deterministic and simple; avoids a retry storm against a locked table. Revisit in Phase 2 alongside the `lock_timeout` test. |
 | D10 | Lease times use the database clock; tests backdate `lease_expires_at` | Inject a Python clock; real short leases with sleeps | One clock shared by all workers, no drift. Backdating is instant and deterministic. |
 | D11 | Hash is sha256 of the exact stored text | Normalize whitespace/case, or hash the parse tree | "Approved this exact statement" should mean byte-for-byte. Nothing edits the SQL in v1, so normalization buys nothing. |
@@ -976,6 +996,7 @@ No production code changed. These came from the review's probes (REVIEW.md §5 a
 | D38 | **Accepted 2026-11-16 (review follow-up 1).** A connection lost during the target `COMMIT` is tested with a TCP relay written in the test file with standard-library sockets (`CommitCuttingProxy`), which cuts the connection when it sees the `COMMIT` message, in two modes: after the server processed it, or before it arrived | `pg_terminate_backend` from a hook (what `test_lost_target_connection_does_not_mark_failed` uses); an external fault-injection proxy such as Toxiproxy; a fake connection object | Killing the session cannot be aimed at the instant between "`COMMIT` sent" and "answer received", and that instant is the only place where the outcome is truly unknown. An external proxy is a new dependency and a new Compose service for about 60 lines of sockets. A fake connection would break invariant 5: the point is what real Postgres does with a half-finished commit. Cost: the proxy finds `COMMIT` by its bytes in one network read, which relies on how psycopg ends a transaction block; each test asserts the cut happened, so a change there fails loudly. |
 | D39 | **Accepted 2026-11-16 (review follow-up 2, finding F1).** At the execution retry limit the worker asks the target with `probe_marker`: the same marker `INSERT` as the normal path, inside a target transaction that is rolled back if the insert succeeded. Results: `ALREADY_APPLIED` → `SUCCEEDED`; `NOT_APPLIED` → `FAILED` "retry limit reached"; `HASH_MISMATCH` → `FAILED` "retry limit reached; target marker exists with a different hash"; any target error → no write, lease abandoned. The marker `INSERT` is written once (`_insert_marker`) and shared with `apply_on_target`. | A plain `SELECT` of the marker (D8 as first built); commit a "tombstone" marker with a fake hash so later stale attempts are refused; `LOCK TABLE relay_applied` then `SELECT`; only widen the README non-guarantee; keep the bare "retry limit reached" for a hash mismatch | The `SELECT` does not wait for an attempt that is inside its target transaction, so Relay could say `FAILED` for a migration that then committed (reproduced in the review). A tombstone would close more of the late-apply gap but changes what a marker means ("this was applied"); that is fencing and belongs with D23. `relay_migrator` has only `SELECT` and `INSERT` on the table, and the lock modes those allow do not conflict with another session's insert. A marker with a different hash is an anomaly a person should see, so the message names it. Cost: the check can now wait up to `LOCK_TIMEOUT`, and a job over the limit whose earlier attempt is stuck costs one lease per retry until the target's idle timeout ends that attempt. **Still open:** an attempt that *starts* after the probe (D23). Tested in `test_retry_limit.py`; mutation `probe-rollback`. |
 | D40 | **Accepted 2026-11-16 (review follow-up 3, finding F3).** Relay's own connections (API requests, workers) are opened with `db.connect_relay`, which sets `lock_timeout` (`RELAY_LOCK_TIMEOUT`, default 5 s) and `idle_in_transaction_session_timeout` (`RELAY_IDLE_TIMEOUT`, default 10 s) for the session, sent as connection startup options after a format check (zero refused). A lock timeout in the API becomes `503` + `Retry-After: 1` through one exception handler (§1 #26). A lock timeout on a worker's write after its claim ends the pass as `abandoned` (one `except` in `run_once`). A session the server ended is handled by the existing reconnect path. Plain `db.connect` (target, `dbinit`, `/health`, tests) is unchanged. | No timeouts (as built through M4); `set_config(..., true)` in every Relay transaction, as the target does; `ALTER DATABASE ... SET`; two `SET` statements after connecting; `409` for the API; retrying the worker's write in place; also a `statement_timeout`; a startup rule tying `RELAY_LOCK_TIMEOUT` to the lease | Invariant 2 covered planned slow work only: a process frozen inside a short transaction held its row lock for as long as its connection lived, blocked the owner's save or every later decision on that migration, and could leave a `PENDING` row locked with no lease to expire (reproduced in the review). Per-transaction settings mean many call sites and one forgotten is silent; a database-wide setting also hits tests and admin sessions and lives outside the code; `SET` after connect costs two round trips per API request (one connection per request, D16). `409` would claim a decision that has not committed. A second retry mechanism contradicts D7. Relay statements touch one row, so a `statement_timeout` adds little; it can be added the same way. D6 makes a late final write safe, so no lease rule is needed (the write can now wait up to 5 s, inside D33's 10 s margin). **Why it cannot hit healthy code:** the idle timeout counts only time inside an open transaction, and every connection is autocommit (D1); three tests run slow work past a 300 ms idle timeout. Cost: under heavy contention on one migration a request can get `503` where it used to wait. |
+| D41 | **Accepted 2026-11-16 (review follow-up 4, finding F4(b)).** A pass that cannot *open* the target connection, for a job within its retry limit, gives its attempt back: one transition `EXECUTING → EXECUTING` through the helper (a new, eleventh legal pair), own token, `attempts` set one lower, audit detail "target unreachable; attempt not counted". The lease is kept and left to expire (D7). Each such pass logs at ERROR with the driver's reason. Everything after the connection opened still counts. **Accepted consequence:** a target that never becomes reachable is retried once per lease forever; the job never fails. D9 is unchanged (a DDL error, timeouts included, is terminal). | Count every claim (D8 as built); a direct `UPDATE` of `attempts` outside the helper, with no event; release the job (`EXECUTING → APPROVED`) with the refund; a separate, larger cap for unreachable passes; also refund lost connections and marker-step timeouts | Counting every claim failed every approved job after an outage longer than `MAX_ATTEMPTS` leases without running its SQL once. A direct `UPDATE` is a second write path with no token discipline of its own and no audit trail (invariants 1 and 3). Releasing puts the job straight back at the head of the queue: a worker would re-claim it in a tight loop, write two events per try, and starve the jobs behind it; keeping the lease gives one lease of backoff for free. A separate cap needs a second counter column and a schema reset; the ERROR log makes a permanent misconfiguration loud instead. Only "could not connect" is certain to have changed nothing; after that, target work was started or its outcome is unknown, so the attempt counts. Cost: the legal table has one edge that does not change the status, and three audit events per job per lease during an outage (claim, refund, reclaim). **Log detail:** psycopg reports no SQLSTATE for a failed connection (checked: bad password, refused, missing database, unknown host all give `None`), so the log line carries the driver's text (for example "password authentication failed") and the SQLSTATE only when one exists. Tested in `test_target_unreachable.py`; mutation `unreachable-refund`. |
 
 ---
 
@@ -985,4 +1006,4 @@ The README may claim only what a test demonstrates (invariant 6). Specific wordi
 
 - Say **"concurrent approvals"**, never "concurrent requests", until the live-HTTP concurrency test exists (§8 Phase 2 backlog). The current test drives 20 threads through the service layer, not 20 HTTP requests (D13).
 - Never say "exactly-once". Say "at-least-once delivery with once-only effects on the target, for the tested workflow".
-- List as non-guarantees: a migration marked `FAILED` may still be applied later by a stale worker (§1 #5, D23); no atomic commit across the two databases; no safety for SQL the policy allows but is still wrong; `X-User` is not authentication.
+- List as non-guarantees: a migration marked `FAILED` may still be applied later by a stale worker (§1 #5, D23); an approved migration is retried without limit, and never marked failed, while the target cannot be reached (D41); no atomic commit across the two databases; no safety for SQL the policy allows but is still wrong; `X-User` is not authentication.

@@ -213,6 +213,7 @@ def test_leaving_leased_state_without_token_raises(conn, from_status):
         ("WAITING_FOR_APPROVAL", "SUCCEEDED"),
         ("APPROVED", "SUCCEEDED"),               # skips execution
         ("APPROVED", "APPROVED"),                # a no-op is not a transition
+        ("DRAFTING", "DRAFTING"),                # the one same-state edge is EXECUTING's (D41)
         ("PENDING", "BOGUS"),                    # not a state at all
     ],
 )
@@ -250,8 +251,50 @@ def test_every_transition_out_of_terminal_states_raises(conn, terminal):
     assert events_of(conn, migration_id) == []
 
 
-def test_legal_table_is_exactly_the_ten_designed_transitions():
-    """Guarantee: the legal table holds the ten transitions of DESIGN.md section 4.1, no more.
+def test_same_state_executing_transition_changes_attempts_only_and_needs_the_token(conn):
+    """Guarantee: the one same-state edge, EXECUTING -> EXECUTING, lets the owner of the
+    lease set `attempts` while the status and the lease stay as they are, and writes its
+    audit event; with another worker's token it matches 0 rows and writes nothing; with no
+    token it raises before any SQL.
+
+    Invariant: 1 and 3. This edge exists so that a worker that could not reach the target
+    can give its attempt back through the helper, with the same token check and audit
+    event as every other worker write (decision D41), instead of a second write path.
+    """
+    migration_id = seed_migration(conn, status="EXECUTING")
+    before = conn.execute(
+        "SELECT lease_token, lease_expires_at FROM migrations WHERE id = %s", (migration_id,)
+    ).fetchone()
+    conn.execute("UPDATE migrations SET attempts = 3 WHERE id = %s", (migration_id,))   # setup; not status
+
+    with conn.transaction():
+        with pytest.raises(ValueError, match="lease_token"):
+            transition(conn, migration_id, "EXECUTING", "EXECUTING", "worker:w1", set_fields={"attempts": 2})
+    with conn.transaction():
+        stranger = transition(
+            conn, migration_id, "EXECUTING", "EXECUTING", "worker:w2",
+            lease_token=uuid.uuid4(), set_fields={"attempts": 2},
+        )
+    with conn.transaction():
+        owner = transition(
+            conn, migration_id, "EXECUTING", "EXECUTING", "worker:w1",
+            lease_token=before["lease_token"], detail="not counted", set_fields={"attempts": 2},
+        )
+
+    assert (stranger, owner) == (False, True)
+    after = conn.execute(
+        "SELECT status, attempts, lease_token, lease_expires_at FROM migrations WHERE id = %s", (migration_id,)
+    ).fetchone()
+    assert after == {"status": "EXECUTING", "attempts": 2, **before}
+    assert events_of(conn, migration_id) == [
+        {"from_status": "EXECUTING", "to_status": "EXECUTING", "actor": "worker:w1", "detail": "not counted"},
+    ]
+
+
+def test_legal_table_is_exactly_the_eleven_designed_transitions():
+    """Guarantee: the legal table holds the eleven transitions of DESIGN.md section 4.1, no
+    more: the ten edges of the workflow and the one same-state edge EXECUTING -> EXECUTING
+    (decision D41).
 
     Invariant: 1. Adding an edge to the workflow should be a deliberate change that also has
     to touch this test.
@@ -267,6 +310,7 @@ def test_legal_table_is_exactly_the_ten_designed_transitions():
         ("EXECUTING", "SUCCEEDED"),
         ("EXECUTING", "FAILED"),
         ("EXECUTING", "APPROVED"),
+        ("EXECUTING", "EXECUTING"),
     }
 
 
